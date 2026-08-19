@@ -1,4 +1,4 @@
-"""Preprocessing orchestration without modeling or feature transformation."""
+"""Schema-inspection orchestration retained as a standalone pipeline step."""
 
 from __future__ import annotations
 

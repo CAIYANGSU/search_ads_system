@@ -1,4 +1,4 @@
-"""Explicit, source-agnostic contracts for delimited datasets."""
+"""Typed configuration contracts for the data-processing pipeline."""
 
 from __future__ import annotations
 
@@ -6,10 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from search_ads_system.common.config import resolve_path
+
 
 @dataclass(frozen=True)
 class DelimitedDatasetConfig:
-    """Configuration required to load a delimited dataset without guessing schema."""
+    """Configuration required to read a delimited file without guessing its schema."""
 
     path: Path
     delimiter: str
@@ -23,32 +25,68 @@ class DelimitedDatasetConfig:
 
 
 @dataclass(frozen=True)
+class OutputPaths:
+    """Every generated artifact path; all must be under the configured outputs root."""
+
+    root: Path
+    schema_report: Path
+    unified_data: Path
+    eda_summary: Path
+    eda_categories: Path
+    feature_data: Path
+    feature_metadata: Path
+
+
+@dataclass(frozen=True)
+class EdaConfig:
+    """Settings for bounded-memory exploratory statistics."""
+
+    categorical_columns: tuple[str, ...]
+    top_k: int
+
+
+@dataclass(frozen=True)
+class FeatureConfig:
+    """Settings for deterministic, model-agnostic feature generation."""
+
+    categorical_columns: tuple[str, ...]
+    missing_category_token: str
+
+
+@dataclass(frozen=True)
 class PreprocessConfig:
-    """Configuration for schema inspection and future preprocessing steps."""
+    """Complete configuration for ingestion, conversion, EDA, and features."""
 
     dataset: DelimitedDatasetConfig
-    schema_report_path: Path
+    outputs: OutputPaths
+    eda: EdaConfig
+    features: FeatureConfig
+
+    @property
+    def schema_report_path(self) -> Path:
+        """Compatibility alias for the original schema-inspection entry point."""
+
+        return self.outputs.schema_report
 
 
 def parse_preprocess_config(raw_config: dict[str, Any], config_path: Path) -> PreprocessConfig:
-    """Parse the explicit preprocessing contract from a loaded YAML mapping."""
+    """Parse and validate the data-pipeline portion of a YAML configuration."""
 
     try:
         preprocessing = raw_config["preprocessing"]
         dataset = preprocessing["dataset"]
+        paths = raw_config["paths"]
     except KeyError as error:
-        raise ValueError("config.yaml must define preprocessing.dataset") from error
+        raise ValueError("Configuration must define paths and preprocessing.dataset") from error
 
     config_directory = config_path.parent.resolve()
-    dataset_path = _resolve_path(dataset["path"], config_directory)
-    report_path = _resolve_path(preprocessing["schema_report_path"], config_directory)
     missing_values = dataset.get("missing_value_tokens", {})
     by_column = {
-        column: tuple(str(token) for token in tokens)
+        str(column): tuple(str(token) for token in tokens)
         for column, tokens in missing_values.get("by_column", {}).items()
     }
-    parsed = DelimitedDatasetConfig(
-        path=dataset_path,
+    parsed_dataset = DelimitedDatasetConfig(
+        path=resolve_path(str(dataset["path"]), config_directory),
         delimiter=str(dataset.get("delimiter", "\t")),
         has_header=bool(dataset.get("has_header", True)),
         encoding=str(dataset.get("encoding", "utf-8")),
@@ -58,13 +96,35 @@ def parse_preprocess_config(raw_config: dict[str, Any], config_path: Path) -> Pr
         missing_value_tokens=tuple(str(token) for token in missing_values.get("default", [""])),
         missing_value_tokens_by_column=by_column,
     )
-    _validate_dataset_config(parsed)
-    return PreprocessConfig(dataset=parsed, schema_report_path=report_path)
-
-
-def _resolve_path(raw_path: str, config_directory: Path) -> Path:
-    path = Path(raw_path)
-    return path if path.is_absolute() else config_directory / path
+    output_root = resolve_path(str(paths["outputs_dir"]), config_directory)
+    outputs = OutputPaths(
+        root=output_root,
+        schema_report=resolve_path(str(paths["schema_report"]), config_directory),
+        unified_data=resolve_path(str(paths["unified_data"]), config_directory),
+        eda_summary=resolve_path(str(paths["eda_summary"]), config_directory),
+        eda_categories=resolve_path(str(paths["eda_categories"]), config_directory),
+        feature_data=resolve_path(str(paths["feature_data"]), config_directory),
+        feature_metadata=resolve_path(str(paths["feature_metadata"]), config_directory),
+    )
+    eda_raw = preprocessing.get("eda", {})
+    feature_raw = preprocessing.get("features", {})
+    parsed = PreprocessConfig(
+        dataset=parsed_dataset,
+        outputs=outputs,
+        eda=EdaConfig(
+            categorical_columns=tuple(str(value) for value in eda_raw.get("categorical_columns", [])),
+            top_k=int(eda_raw.get("top_k", 20)),
+        ),
+        features=FeatureConfig(
+            categorical_columns=tuple(str(value) for value in feature_raw.get("categorical_columns", [])),
+            missing_category_token=str(feature_raw.get("missing_category_token", "__MISSING__")),
+        ),
+    )
+    _validate_dataset_config(parsed.dataset)
+    _validate_output_paths(parsed.outputs)
+    if parsed.eda.top_k <= 0:
+        raise ValueError("preprocessing.eda.top_k must be greater than zero")
+    return parsed
 
 
 def _validate_dataset_config(config: DelimitedDatasetConfig) -> None:
@@ -86,3 +146,14 @@ def _validate_dataset_config(config: DelimitedDatasetConfig) -> None:
             "missing_value_tokens.by_column refers to undeclared columns: "
             f"{sorted(unknown_missing_columns)}"
         )
+
+
+def _validate_output_paths(outputs: OutputPaths) -> None:
+    root = outputs.root.resolve()
+    for name, path in vars(outputs).items():
+        if name == "root":
+            continue
+        try:
+            path.resolve().relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"paths.{name} must be within paths.outputs_dir: {path}") from error

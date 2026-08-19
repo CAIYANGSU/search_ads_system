@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,8 @@ import pandas as pd
 
 from search_ads_system.data.dataset import iter_delimited_chunks
 from search_ads_system.data.interfaces import DelimitedDatasetConfig
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -60,6 +63,7 @@ def inspect_schema(config: DelimitedDatasetConfig) -> dict[str, Any]:
             type_states = {column: _TypeState() for column in column_names}
 
         row_count += len(chunk)
+        LOGGER.info("Inspected %s source rows so far", row_count)
         for column in column_names:
             missing = _missing_mask(chunk[column], config, column)
             missing_counts[column] += int(missing.sum())

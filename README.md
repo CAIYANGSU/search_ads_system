@@ -1,51 +1,41 @@
 # Search Ads Algorithm System
 
-一个用于模拟搜索广告/推荐广告全链路的工业级算法系统骨架。项目当前仅提供目录、模块边界、配置和接口占位；不包含模型实现，也不假设任何特定数据集（包括 Criteo）的字段定义。
+搜索/推荐广告算法系统的第一阶段已经实现数据处理 pipeline。当前不包含、也不会执行任何模型训练；后续的召回、排序与价值预估模块仍只是预留边界。
 
-## Pipeline
-
-```text
-Data Processing
-      -> Recall
-      -> PreRank
-      -> Ranking
-      -> Value Ranking
-      -> Auction Simulation
-      -> Evaluation
-```
-
-| 阶段 | 包 | 责任 |
-| --- | --- | --- |
-| Data Processing | `data` | 数据接入契约、校验、特征处理与数据集拆分 |
-| Recall | `recall` | 召回接口、Two Tower 预留、FAISS ANN 检索预留 |
-| PreRank | `prerank` | 轻量级候选粗排接口 |
-| Ranking | `ranking` | 精排基类及 DeepFM、DCNv2、DIN 扩展位 |
-| Value Ranking | `value_ranking` | 价值预估与 ESMM / 多任务 CTR-CVR 扩展位 |
-| Auction Simulation | `auction` | 广告竞价与出价仿真接口 |
-| Evaluation | `evaluation` | 离线效果与业务指标评估接口 |
-
-## Layout
+## 数据流程
 
 ```text
-.
-├── config.yaml                    # 统一运行配置
-├── requirements.txt
-├── pyproject.toml
-├── scripts/                       # 后续训练、评估入口
-├── src/search_ads_system/
-│   ├── common/                    # 配置、共享类型
-│   ├── data/                      # 数据处理
-│   ├── recall/                    # 召回
-│   ├── prerank/                   # 粗排
-│   ├── ranking/                   # 精排
-│   ├── value_ranking/             # 价值排序
-│   ├── auction/                   # 竞价仿真
-│   ├── evaluation/                # 评估
-│   └── pipelines/                 # 全链路编排
-└── tests/                         # 与源码结构对应的测试目录
+CriteoSearchData (TSV, raw)
+        │
+        ├── scripts/run_preprocess.py  → outputs/preprocessing/schema_report.json
+        │
+        ├── scripts/convert_criteo.py → outputs/processed/criteo_unified/part-*.csv
+        │
+        ├── scripts/run_eda.py        → outputs/eda/summary.json
+        │                                outputs/eda/top_categories.csv
+        │
+        └── scripts/build_features.py → outputs/features/criteo_features/part-*.csv
+                                         outputs/features/metadata.json
 ```
 
-## Quick start
+所有 pipeline 产物均由 `config.yaml` 的 `paths` 管理，并且必须位于 `paths.outputs_dir`（默认 `outputs/`）下。原始数据不会被修改。CSV 按分块写入，避免将约 6GB 的源文件一次性读入内存。
+
+## Criteo 统一 Schema
+
+每一行代表一次广告点击事件。由于原始数据没有 click ID，转换阶段基于原始行号生成稳定的 `event_id`（例如 `criteo-000000000001`）。`-1`（及 `click_timestamp` 的 `0`）转换为空值。
+
+| 原始字段 | 统一字段 |
+| --- | --- |
+| `Sale` | `conversion_label` |
+| `SalesAmountInEuro` | `conversion_value_eur` |
+| `time_delay_for_conversion` | `conversion_delay_seconds` |
+| `nb_clicks_1week` | `clicks_last_7d` |
+| `click_timestamp` | `click_timestamp` |
+| 商品、用户、Partner、类别字段 | 对应 `product_*`、`user_id`、`partner_id` 字段 |
+
+完整字段定义在 `src/search_ads_system/data/unified_schema.py` 的 `UNIFIED_COLUMNS`。转换会校验 `Sale` 是二元标签，避免将异常标签带入后续步骤。
+
+## 安装
 
 ```bash
 python3.12 -m venv .venv
@@ -53,20 +43,53 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-在接入数据时，请先在 `data/interfaces.py` 中定义本项目的数据契约，并在 `config.yaml` 填写实际路径。保持数据字段定义由数据所有者显式提供，避免依赖隐含的公开数据集 schema。
+默认配置假设原始文件位于：
 
-## Dataset schema check
+`criteo_search_conversion/Criteo_Conversion_Search/CriteoSearchData`
 
-`scripts/run_preprocess.py` 是当前的预处理入口。它按 `config.yaml` 中的显式数据契约分块扫描源文件，并输出文件大小、行数、列名、推断 dtype、缺失率和已配置标签的分布；它不会训练模型或写出特征数据。
+如文件位置不同，请只修改 `config.yaml` 中的 `preprocessing.dataset.path`；产物位置和分块大小分别由 `paths` 与 `preprocessing.dataset.chunk_size` 配置。
+
+## 运行
+
+请按以下顺序执行，每个命令都可独立运行并接收 `--config` 指向另一份 YAML 配置。
 
 ```bash
+# 1. 仅扫描原始 schema、缺失率、推断类型与标签分布
 python3.12 scripts/run_preprocess.py --config config.yaml
+
+# 2. 生成统一 schema 的分块 CSV；首次运行无需 --overwrite
+python3.12 scripts/convert_criteo.py --config config.yaml
+
+# 3. 对统一数据生成行数、转化率、缺失率、数值统计和 Top-K 类别统计
+python3.12 scripts/run_eda.py --config config.yaml
+
+# 4. 生成基础数值、缺失指示、UTC 时间和类别特征
+python3.12 scripts/build_features.py --config config.yaml
 ```
 
-报告默认写入 `artifacts/preprocessing/schema_report.json`。Criteo Search Conversion 原始文件没有表头；配置中 23 个列名及 `Sale` 标签选择均来自随数据发布的 README，而不是由代码根据字段内容推断。
+转换或特征输出目录已经存在时，命令会主动停止，防止混入不同批次产物。确认要重新生成时，显式传入 `--overwrite`：
 
-## Planned model extensions
+```bash
+python3.12 scripts/convert_criteo.py --config config.yaml --overwrite
+python3.12 scripts/build_features.py --config config.yaml --overwrite
+```
 
-- Recall: Two Tower、FAISS ANN Search
-- Ranking: DeepFM、DCNv2、DIN
-- Value Ranking: ESMM、Multi-task CTR-CVR
+## EDA 与特征约定
+
+EDA 使用分块累积统计，输出总体行数、转化数/转化率、每列缺失率、关键数值列的非空数/均值/最小值/最大值，及配置中低基数类别列的 Top-K 值。类别统计列由 `preprocessing.eda.categorical_columns` 控制，避免高基数 ID 造成不必要的内存占用。
+
+特征工程不拟合全局统计量，也不使用标签构造特征，以避免数据泄漏。它保留三个标签列，并生成：
+
+- `product_price`、`clicks_last_7d` 的零填充值、缺失指示与 `log1p` 特征；
+- `click_hour_utc`、`click_day_of_week_utc` 与时间戳缺失指示；
+- 配置所选字段的 `cat_*` 类别特征，缺失值替换为 `__MISSING__`。
+
+`outputs/features/metadata.json` 记录版本、特征列表、标签列和缺失类别 token，供后续模型阶段消费。
+
+## 开发与验证
+
+```bash
+PYTHONPATH=src python3.12 -m pytest tests/data/test_criteo_pipeline.py
+```
+
+该测试用两行临时 Criteo 格式数据覆盖分块转换、EDA 与特征工程，不会读取或写入真实数据集。

@@ -1,12 +1,17 @@
-# Runtime configuration. Supply actual data contracts and paths before running.
+# Runtime configuration for the data pipeline and reserved model stages.
 project:
   name: search-ads-algorithm-system
   seed: 2026
 
-data:
-  raw_path: criteo_search_conversion/Criteo_Conversion_Search/CriteoSearchData
-  processed_path: data/processed
-  artifact_path: artifacts
+# All generated data products are kept below outputs/. Raw input is read in place.
+paths:
+  outputs_dir: outputs
+  schema_report: outputs/preprocessing/schema_report.json
+  unified_data: outputs/processed/criteo_unified
+  eda_summary: outputs/eda/summary.json
+  eda_categories: outputs/eda/top_categories.csv
+  feature_data: outputs/features/criteo_features
+  feature_metadata: outputs/features/metadata.json
 
 preprocessing:
   # This contract is transcribed from the dataset's bundled README. The source
@@ -47,7 +52,25 @@ preprocessing:
       default: ["", "-1"]
       by_column:
         click_timestamp: ["0"]
-  schema_report_path: artifacts/preprocessing/schema_report.json
+  eda:
+    categorical_columns: [device_type, product_age_group, product_gender, product_country]
+    top_k: 20
+  features:
+    categorical_columns:
+      - device_type
+      - product_age_group
+      - product_gender
+      - product_brand
+      - product_country
+      - audience_id
+      - product_category_1
+      - product_category_2
+      - product_category_3
+      - product_category_4
+      - product_category_5
+      - product_category_6
+      - product_category_7
+    missing_category_token: __MISSING__
 
 training:
   batch_size: 512
