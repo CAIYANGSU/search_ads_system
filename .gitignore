@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+data/raw/
+data/processed/
+artifacts/
+
+# datasets
+criteo_attribution/
+criteo_search_conversion/
+
+# model outputs
+outputs/
+checkpoints/
+logs/
+
+# macOS
+.DS_Store
+._*

@@ -1,0 +1,7 @@
+# Runtime dependencies (Python 3.12)
+torch==2.8.0
+pandas>=2.2,<3.0
+scikit-learn>=1.5,<2.0
+numpy>=2.0,<3.0
+faiss-cpu>=1.9,<2.0
+PyYAML>=6.0,<7.0

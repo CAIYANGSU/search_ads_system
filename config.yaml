@@ -1,0 +1,85 @@
+# Runtime configuration. Supply actual data contracts and paths before running.
+project:
+  name: search-ads-algorithm-system
+  seed: 2026
+
+data:
+  raw_path: criteo_search_conversion/Criteo_Conversion_Search/CriteoSearchData
+  processed_path: data/processed
+  artifact_path: artifacts
+
+preprocessing:
+  # This contract is transcribed from the dataset's bundled README. The source
+  # file itself has no header, so the ordered names must be supplied explicitly.
+  dataset:
+    path: criteo_search_conversion/Criteo_Conversion_Search/CriteoSearchData
+    delimiter: "\t"
+    has_header: false
+    encoding: utf-8
+    chunk_size: 200000
+    column_names:
+      - Sale
+      - SalesAmountInEuro
+      - time_delay_for_conversion
+      - click_timestamp
+      - nb_clicks_1week
+      - product_price
+      - product_age_group
+      - device_type
+      - audience_id
+      - product_gender
+      - product_brand
+      - product_category_1
+      - product_category_2
+      - product_category_3
+      - product_category_4
+      - product_category_5
+      - product_category_6
+      - product_category_7
+      - product_country
+      - product_id
+      - product_title
+      - partner_id
+      - user_id
+    # Label selection is configuration, not inferred by preprocessing code.
+    label_columns: [Sale]
+    missing_value_tokens:
+      default: ["", "-1"]
+      by_column:
+        click_timestamp: ["0"]
+  schema_report_path: artifacts/preprocessing/schema_report.json
+
+training:
+  batch_size: 512
+  learning_rate: 0.001
+  epochs: 10
+  num_workers: 4
+  device: auto
+
+recall:
+  model: two_tower
+  embedding_dim: 128
+  top_k: 200
+  ann:
+    index_type: flat
+    metric: inner_product
+
+prerank:
+  model: placeholder
+  top_k: 100
+
+ranking:
+  model: deepfm
+  hidden_dims: [256, 128]
+  dropout: 0.1
+
+value_ranking:
+  model: esmm
+  tasks: [ctr, cvr]
+
+auction:
+  mechanism: second_price
+  reserve_price: 0.0
+
+evaluation:
+  metrics: [auc, logloss, ndcg]
