@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +40,10 @@ class ItemCFRecallConfig:
     interaction_aggregation: str
     similarity: str
     input_chunk_size: int
+    user_sampling_enabled: bool = False
+    user_sampling_max_users: int | None = None
+    user_sampling_seed: int = 2026
+    user_batch_size: int = 10_000
 
 
 def parse_itemcf_config(raw_config: Mapping[str, Any], config_path: Path) -> ItemCFRecallConfig:
@@ -72,6 +78,26 @@ def parse_itemcf_config(raw_config: Mapping[str, Any], config_path: Path) -> Ite
     if any(weight < 0 for weight in label_weights.values()):
         raise ValueError("recall.itemcf.interaction_label_weights must be non-negative")
 
+    sampling_config = itemcf.get("user_sampling", {})
+    if not isinstance(sampling_config, Mapping):
+        raise ValueError("recall.itemcf.user_sampling must be a mapping")
+    # Keep the candidate-generation options alongside ItemCF.  The fallback is
+    # accepted for early configs that placed it directly under ``recall``.
+    candidate_generation_config = itemcf.get(
+        "candidate_generation", recall_config.get("candidate_generation", {})
+    )
+    if not isinstance(candidate_generation_config, Mapping):
+        raise ValueError("recall.itemcf.candidate_generation must be a mapping")
+    if "num_workers" in candidate_generation_config:
+        LOGGER.warning(
+            "recall.itemcf.candidate_generation.num_workers is ignored: "
+            "candidate generation uses a single vectorised process to avoid IPC overhead"
+        )
+    project_config = raw_config.get("project", {})
+    if not isinstance(project_config, Mapping):
+        raise ValueError("project configuration must be a mapping")
+
+    max_users = sampling_config.get("max_users")
     config = ItemCFRecallConfig(
         input_path=input_path,
         output_path=output_path,
@@ -84,6 +110,10 @@ def parse_itemcf_config(raw_config: Mapping[str, Any], config_path: Path) -> Ite
         interaction_aggregation=str(itemcf.get("interaction_aggregation", "sum")).lower(),
         similarity=str(itemcf.get("similarity", "cosine")).lower(),
         input_chunk_size=int(itemcf.get("input_chunk_size", 200_000)),
+        user_sampling_enabled=bool(sampling_config.get("enabled", False)),
+        user_sampling_max_users=None if max_users is None else int(max_users),
+        user_sampling_seed=int(sampling_config.get("seed", project_config.get("seed", 2026))),
+        user_batch_size=int(candidate_generation_config.get("user_batch_size", 10_000)),
     )
     _validate_config(config)
     return config
@@ -214,7 +244,11 @@ def recall_top_k(
     item_ids: np.ndarray,
     top_k: int,
 ) -> pd.DataFrame:
-    """Score unseen items from each user's history and return deterministic Top-K rows."""
+    """Score unseen items from each user's history and return deterministic Top-K rows.
+
+    This reference helper retains the original per-user implementation.  The
+    production pipeline uses the equivalent vectorised batch implementation.
+    """
 
     if top_k <= 0:
         raise ValueError("top_k must be greater than zero")
@@ -238,15 +272,13 @@ def recall_top_k(
         candidate_scores = candidate_scores[unseen]
         if not len(candidate_indices):
             continue
-
-        # Item ID is the deterministic secondary key when ItemCF scores tie.
         order = np.lexsort((item_ids[candidate_indices], -candidate_scores))[:top_k]
         for rank, candidate_position in enumerate(order, start=1):
             item_index = candidate_indices[candidate_position]
             rows.append(
                 (str(user_id), str(item_ids[item_index]), float(candidate_scores[candidate_position]), rank)
             )
-    return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+    return _rows_to_candidates(rows)
 
 
 def generate_itemcf_candidates(
@@ -261,9 +293,29 @@ def generate_itemcf_candidates(
     )
     matrix, user_ids, item_ids = build_user_item_matrix(prepared)
     LOGGER.info("Built user-item matrix with users=%s items=%s nnz=%s", *matrix.shape, matrix.nnz)
+    similarity_started_at = time.monotonic()
     similarity = compute_item_similarity(matrix, config.similarity)
-    LOGGER.info("Built item similarity matrix with nnz=%s", similarity.nnz)
-    candidates = recall_top_k(matrix, similarity, user_ids, item_ids, config.top_k)
+    LOGGER.info(
+        "Similarity matrix construction completed: at=%s elapsed seconds=%.2f nnz=%s",
+        _wall_clock_timestamp(),
+        time.monotonic() - similarity_started_at,
+        similarity.nnz,
+    )
+    selected_user_indices = _select_candidate_users(matrix, config)
+    LOGGER.info(
+        "Candidate generation started: at=%s users=%s batch_size=%s execution=batch_sparse_vectorized",
+        _wall_clock_timestamp(),
+        len(selected_user_indices),
+        config.user_batch_size,
+    )
+    candidates = _generate_candidates_in_batches(
+        matrix,
+        similarity,
+        user_ids,
+        item_ids,
+        selected_user_indices,
+        config,
+    )
     return candidates.astype(
         {"user_id": "string", "candidate_ad_id": "string", "itemcf_score": "float64", "rank": "int64"}
     )
@@ -303,11 +355,168 @@ def _normalise_label_key(value: object) -> str:
     return str(value).strip().lower()
 
 
+def _select_candidate_users(
+    user_item_matrix: sparse.csr_matrix,
+    config: ItemCFRecallConfig,
+) -> np.ndarray:
+    """Select reproducible candidate-generation users with at least one interaction."""
+
+    valid_user_indices = np.flatnonzero(np.diff(user_item_matrix.indptr) > 0).astype(np.int64)
+    total_users = len(valid_user_indices)
+    if not config.user_sampling_enabled:
+        selected_user_indices = valid_user_indices
+    else:
+        max_users = min(config.user_sampling_max_users or 0, total_users)
+        random_generator = np.random.default_rng(config.user_sampling_seed)
+        selected_user_indices = np.sort(
+            random_generator.choice(valid_user_indices, size=max_users, replace=False)
+        ).astype(np.int64)
+    LOGGER.info(
+        "Candidate-generation user selection: total users=%s sampled users=%s",
+        total_users,
+        len(selected_user_indices),
+    )
+    return selected_user_indices
+
+
+def _generate_candidates_in_batches(
+    user_item_matrix: sparse.csr_matrix,
+    item_similarity: sparse.csr_matrix,
+    user_ids: np.ndarray,
+    item_ids: np.ndarray,
+    selected_user_indices: np.ndarray,
+    config: ItemCFRecallConfig,
+) -> pd.DataFrame:
+    """Generate candidates with batch sparse multiplication and vectorised Top-K."""
+
+    total_users = len(selected_user_indices)
+    started_at = time.monotonic()
+    batches = [
+        selected_user_indices[start : start + config.user_batch_size]
+        for start in range(0, total_users, config.user_batch_size)
+    ]
+    # Returning millions of Python tuples from child processes caused IPC and
+    # parent-side deserialisation to dominate the previous multiprocessing path.
+    # Batch sparse multiplication plus vectorised filtering/sorting is faster
+    # and has predictable memory use in one process.
+    batch_candidates = _append_batch_results(
+        (
+            _recall_user_batch(batch, user_item_matrix, item_similarity, user_ids, item_ids, config.top_k)
+            for batch in batches
+        ),
+        total_users,
+        config.user_batch_size,
+    )
+    candidates = (
+        pd.concat(batch_candidates, ignore_index=True)
+        if batch_candidates
+        else pd.DataFrame(columns=OUTPUT_COLUMNS)
+    )
+    elapsed_seconds = time.monotonic() - started_at
+    LOGGER.info(
+        "Candidate generation benchmark: processed users=%s elapsed seconds=%.2f users/sec=%.2f "
+        "average candidates per user=%.2f total candidates generated=%s",
+        total_users,
+        elapsed_seconds,
+        total_users / elapsed_seconds if elapsed_seconds else 0.0,
+        len(candidates) / total_users if total_users else 0.0,
+        len(candidates),
+    )
+    return candidates
+
+
+def _append_batch_results(
+    batch_results: Iterable[pd.DataFrame],
+    total_users: int,
+    user_batch_size: int,
+) -> list[pd.DataFrame]:
+    processed_users = 0
+    candidates: list[pd.DataFrame] = []
+    for batch_candidates in batch_results:
+        if not batch_candidates.empty:
+            candidates.append(batch_candidates)
+        processed_users = min(processed_users + user_batch_size, total_users)
+        LOGGER.info("Processing users: %s / %s", processed_users, total_users)
+    return candidates
+
+
+def _recall_user_batch(
+    user_indices: np.ndarray,
+    user_item_matrix: sparse.csr_matrix,
+    item_similarity: sparse.csr_matrix,
+    user_ids: np.ndarray,
+    item_ids: np.ndarray,
+    top_k: int,
+) -> pd.DataFrame:
+    """Score one user batch, remove seen items, then deterministically Top-K it.
+
+    All operations after sparse matrix multiplication are array based.  This
+    deliberately avoids one Python callback, sparse-row slice, and tuple loop
+    for every user in the batch.
+    """
+    score_matrix = (user_item_matrix[user_indices] @ item_similarity).tocsr()
+    if score_matrix.nnz == 0:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+
+    # Subtracting the score at every observed coordinate is equivalent to the
+    # former per-user ``np.isin`` filter, regardless of interaction weight.
+    seen_mask = user_item_matrix[user_indices].copy()
+    seen_mask.data = np.ones(seen_mask.nnz, dtype=score_matrix.dtype)
+    score_matrix = (score_matrix - score_matrix.multiply(seen_mask)).tocsr()
+    score_matrix.eliminate_zeros()
+    if score_matrix.nnz == 0:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+
+    row_counts = np.diff(score_matrix.indptr)
+    batch_user_positions = np.repeat(np.arange(len(user_indices), dtype=np.int64), row_counts)
+    candidate_item_indices = score_matrix.indices
+    candidate_scores = score_matrix.data
+
+    # The key order matches the prior per-user lexsort exactly: score DESC,
+    # item_id ASC, with batch user position as an outer grouping key.
+    ordered_positions = np.lexsort(
+        (item_ids[candidate_item_indices], -candidate_scores, batch_user_positions)
+    )
+    ordered_users = batch_user_positions[ordered_positions]
+    group_starts = np.empty(len(ordered_positions), dtype=bool)
+    group_starts[0] = True
+    group_starts[1:] = ordered_users[1:] != ordered_users[:-1]
+    positions = np.arange(len(ordered_positions), dtype=np.int64)
+    group_start_positions = np.maximum.accumulate(np.where(group_starts, positions, 0))
+    ranks = positions - group_start_positions + 1
+    top_k_positions = ordered_positions[ranks <= top_k]
+
+    selected_batch_positions = batch_user_positions[top_k_positions]
+    return pd.DataFrame(
+        {
+            "user_id": user_ids[user_indices[selected_batch_positions]],
+            "candidate_ad_id": item_ids[candidate_item_indices[top_k_positions]],
+            "itemcf_score": candidate_scores[top_k_positions],
+            "rank": ranks[ranks <= top_k],
+        },
+        columns=OUTPUT_COLUMNS,
+    )
+
+
+def _rows_to_candidates(rows: list[tuple[str, str, float, int]]) -> pd.DataFrame:
+    return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+
+
+def _wall_clock_timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
 def _validate_config(config: ItemCFRecallConfig) -> None:
     if config.top_k <= 0:
         raise ValueError("recall.itemcf.top_k must be greater than zero")
     if config.input_chunk_size <= 0:
         raise ValueError("recall.itemcf.input_chunk_size must be greater than zero")
+    if config.user_sampling_enabled and config.user_sampling_max_users is None:
+        raise ValueError("recall.itemcf.user_sampling.max_users is required when sampling is enabled")
+    if config.user_sampling_max_users is not None and config.user_sampling_max_users <= 0:
+        raise ValueError("recall.itemcf.user_sampling.max_users must be greater than zero")
+    if config.user_batch_size <= 0:
+        raise ValueError("recall.itemcf.candidate_generation.user_batch_size must be greater than zero")
     if config.default_interaction_weight < 0:
         raise ValueError("recall.itemcf.default_interaction_weight must be non-negative")
     if config.interaction_aggregation not in {"sum", "max"}:

@@ -100,6 +100,13 @@ recall:
     interaction_aggregation: sum
     similarity: cosine
     input_chunk_size: 200000
+    # Sampling is deliberately applied after the full item-similarity matrix
+    # has been built, so it changes only the users emitted in the candidates.
+    user_sampling:
+      enabled: true
+      max_users: 1000000
+    candidate_generation:
+      user_batch_size: 10000
 
 prerank:
   model: placeholder
