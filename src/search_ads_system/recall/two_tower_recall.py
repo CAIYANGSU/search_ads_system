@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import random
 import time
@@ -21,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 from search_ads_system.common.config import load_yaml_config, resolve_path
 from search_ads_system.recall.faiss_index import (
     build_faiss_index,
+    load_faiss_index,
     save_faiss_index,
     search_faiss_index,
 )
@@ -53,6 +55,7 @@ class TwoTowerRecallConfig:
     ef_construction: int = 200
     ef_search: int = 64
     train: bool = False
+    search_batch_size: int = 10_000
     inference_batch_size: int = 4096
     input_chunk_size: int = 200_000
 
@@ -168,6 +171,7 @@ def parse_two_tower_config(raw_config: Mapping[str, Any], config_path: Path) -> 
         # ``train`` is the public inference/training switch.  The fallback
         # retains support for configs written before this option existed.
         train=bool(options.get("train", not bool(options.get("reuse_checkpoint", True)))),
+        search_batch_size=int(options.get("search_batch_size", 10_000)),
         inference_batch_size=int(options.get("inference_batch_size", 4096)),
         input_chunk_size=int(options.get("input_chunk_size", 200_000)),
     )
@@ -333,17 +337,12 @@ def save_checkpoint(model: TwoTowerModel, config: TwoTowerRecallConfig, user_ids
 def load_checkpoint(config: TwoTowerRecallConfig, user_ids: np.ndarray, product_ids: np.ndarray, device: torch.device) -> TwoTowerModel:
     """Load a trained tower and verify it matches the current data vocabularies."""
 
-    try:
-        checkpoint = torch.load(config.checkpoint_path, map_location=device, weights_only=False)
-    except (OSError, RuntimeError) as error:
-        raise RuntimeError(f"Unable to load Two Tower checkpoint: {config.checkpoint_path}") from error
-    if not isinstance(checkpoint, Mapping):
-        raise ValueError("Two Tower checkpoint must be a mapping")
+    checkpoint = _read_checkpoint(config.checkpoint_path, device)
     checkpoint_users = np.asarray(checkpoint.get("user_ids", []), dtype=str)
     checkpoint_products = np.asarray(checkpoint.get("product_ids", []), dtype=str)
     if not np.array_equal(checkpoint_users, user_ids) or not np.array_equal(checkpoint_products, product_ids):
         raise ValueError(
-            "Checkpoint vocabularies do not match the current interactions; set reuse_checkpoint=false to retrain"
+            "Checkpoint vocabularies do not match the current interactions; set train=true to retrain"
         )
     embedding_dim = int(checkpoint.get("embedding_dim", config.embedding_dim))
     if embedding_dim != config.embedding_dim:
@@ -355,32 +354,42 @@ def load_checkpoint(config: TwoTowerRecallConfig, user_ids: np.ndarray, product_
     return model
 
 
-def run_two_tower_recall(config: TwoTowerRecallConfig) -> pd.DataFrame:
-    """Execute data preparation, training, index creation, and offline recall."""
+def load_checkpoint_for_inference(
+    config: TwoTowerRecallConfig, device: torch.device,
+) -> tuple[TwoTowerModel, np.ndarray, np.ndarray]:
+    """Load a checkpoint and its ID vocabularies without reading training data."""
 
-    _set_seed(config.seed)
-    device = _select_device(config.device)
-    LOGGER.info("Two Tower training device: %s", device)
-    interactions = load_interactions(config)
-    user_codes, ad_codes, weights, user_ids, product_ids, histories, stats = prepare_training_data(interactions, config)
-    LOGGER.info("Training sample statistics: %s", stats)
+    checkpoint = _read_checkpoint(config.checkpoint_path, device)
+    user_ids = np.asarray(checkpoint.get("user_ids", []), dtype=str)
+    product_ids = np.asarray(checkpoint.get("product_ids", []), dtype=str)
+    embedding_dim = int(checkpoint.get("embedding_dim", config.embedding_dim))
     if not len(user_ids) or not len(product_ids):
-        raise ValueError("No valid interactions available for Two Tower training")
-    if not config.train and config.checkpoint_path.is_file():
-        model = load_checkpoint(config, user_ids, product_ids, device)
-    else:
-        if not config.train:
-            LOGGER.info("No existing checkpoint at %s; training Two Tower model", config.checkpoint_path)
-        else:
-            LOGGER.info("Two Tower training forced by recall.two_tower.train=true")
-        dataset = NegativeSamplingDataset(
-            user_codes, ad_codes, weights, histories, len(product_ids), config.negative_samples, config.seed
-        )
-        if not len(dataset):
-            raise ValueError("Cannot sample negatives: every user has interacted with every advertisement")
-        model = TwoTowerModel(len(user_ids), len(product_ids), config.embedding_dim)
-        train_two_tower(model, dataset, config, device)
-        save_checkpoint(model, config, user_ids, product_ids)
+        raise ValueError("Two Tower checkpoint is missing user_ids or product_ids")
+    if embedding_dim != config.embedding_dim:
+        raise ValueError("Checkpoint embedding_dim does not match recall.two_tower.embedding_dim")
+    model = TwoTowerModel(len(user_ids), len(product_ids), embedding_dim)
+    model.load_state_dict(checkpoint["state_dict"])
+    model.to(device)
+    model.eval()
+    LOGGER.info("Loaded Two Tower checkpoint for inference from %s", config.checkpoint_path)
+    return model, user_ids, product_ids
+
+
+def load_or_build_faiss_index(
+    model: TwoTowerModel, product_ids: np.ndarray, config: TwoTowerRecallConfig, device: torch.device,
+) -> tuple[Any, np.ndarray]:
+    """Load the persisted ANN index, rebuilding it only when it is absent."""
+
+    if config.index_path.is_file():
+        index, indexed_product_ids = load_faiss_index(config.index_path)
+        if not np.array_equal(indexed_product_ids, product_ids):
+            raise ValueError("FAISS index product IDs do not match the loaded Two Tower checkpoint")
+        if hasattr(index, "hnsw"):
+            index.hnsw.efSearch = config.ef_search
+        LOGGER.info("Loaded existing FAISS index from %s; index construction skipped", config.index_path)
+        return index, indexed_product_ids
+
+    LOGGER.info("FAISS index does not exist at %s; building it from checkpoint ad embeddings", config.index_path)
     ad_embeddings = extract_embeddings(model, len(product_ids), "ad", config.inference_batch_size, device)
     index_started_at = time.monotonic()
     index = build_faiss_index(
@@ -394,17 +403,107 @@ def run_two_tower_recall(config: TwoTowerRecallConfig) -> pd.DataFrame:
     save_faiss_index(index, product_ids, config.index_path)
     LOGGER.info(
         "FAISS index build benchmark: index_type=%s ads=%s index build time=%.2f seconds path=%s",
-        config.faiss_index_type,
-        index.ntotal,
-        index_build_seconds,
-        config.index_path,
+        config.faiss_index_type, index.ntotal, index_build_seconds, config.index_path,
     )
-    user_embeddings = extract_embeddings(model, len(user_ids), "user", config.inference_batch_size, device)
-    candidates = generate_two_tower_candidates(
-        user_ids, user_embeddings, product_ids, index, histories, config.top_k, config.inference_batch_size
+    return index, product_ids
+
+
+@torch.no_grad()
+def stream_two_tower_candidates(
+    model: TwoTowerModel,
+    user_ids: np.ndarray,
+    product_ids: np.ndarray,
+    index: Any,
+    output_path: Path,
+    *,
+    top_k: int,
+    search_batch_size: int,
+    device: torch.device,
+) -> int:
+    """Retrieve and write one user batch at a time without global result state.
+
+    The checkpoint provides the full user vocabulary.  Each batch produces its
+    user embeddings, calls FAISS, and immediately writes CSV rows, so memory
+    is bounded by ``search_batch_size * top_k`` rather than all users.
+    """
+
+    if top_k <= 0 or search_batch_size <= 0:
+        raise ValueError("top_k and search_batch_size must be greater than zero")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    started_at = time.monotonic()
+    processed_users = 0
+    written_rows = 0
+    model.eval()
+    with temporary_path.open("w", newline="", encoding="utf-8") as output_file:
+        writer = csv.writer(output_file)
+        writer.writerow(OUTPUT_COLUMNS)
+        for start in range(0, len(user_ids), search_batch_size):
+            stop = min(start + search_batch_size, len(user_ids))
+            user_indices = torch.arange(start, stop, device=device)
+            user_embeddings = model.encode_users(user_indices).cpu().numpy().astype(np.float32, copy=False)
+            scores, positions = search_faiss_index(index, user_embeddings, top_k)
+            for relative_position, user_id in enumerate(user_ids[start:stop]):
+                for rank, (score, ad_position) in enumerate(
+                    zip(scores[relative_position], positions[relative_position], strict=True), start=1
+                ):
+                    if ad_position < 0:
+                        continue
+                    writer.writerow((str(user_id), str(product_ids[int(ad_position)]), float(score), rank))
+                    written_rows += 1
+            processed_users = stop
+            elapsed_seconds = time.monotonic() - started_at
+            LOGGER.info(
+                "Memory-friendly FAISS retrieval benchmark: processed_users=%s elapsed_time=%.2f seconds "
+                "users_per_second=%.2f",
+                processed_users,
+                elapsed_seconds,
+                processed_users / elapsed_seconds if elapsed_seconds else 0.0,
+            )
+    temporary_path.replace(output_path)
+    LOGGER.info("Wrote %s streamed Two Tower candidates to %s", written_rows, output_path)
+    return written_rows
+
+
+def run_two_tower_recall(config: TwoTowerRecallConfig) -> pd.DataFrame:
+    """Train when requested, then run memory-bounded offline FAISS recall."""
+
+    _set_seed(config.seed)
+    device = _select_device(config.device)
+    LOGGER.info("Two Tower inference device: %s", device)
+    if not config.train and config.checkpoint_path.is_file():
+        # The inference path intentionally avoids loading the interaction data.
+        # User and product vocabularies are checkpointed with the model.
+        model, user_ids, product_ids = load_checkpoint_for_inference(config, device)
+    else:
+        if not config.train:
+            LOGGER.info("No existing checkpoint at %s; training Two Tower model", config.checkpoint_path)
+        else:
+            LOGGER.info("Two Tower training forced by recall.two_tower.train=true")
+        interactions = load_interactions(config)
+        user_codes, ad_codes, weights, user_ids, product_ids, histories, stats = prepare_training_data(
+            interactions, config
+        )
+        LOGGER.info("Training sample statistics: %s", stats)
+        if not len(user_ids) or not len(product_ids):
+            raise ValueError("No valid interactions available for Two Tower training")
+        dataset = NegativeSamplingDataset(
+            user_codes, ad_codes, weights, histories, len(product_ids), config.negative_samples, config.seed
+        )
+        if not len(dataset):
+            raise ValueError("Cannot sample negatives: every user has interacted with every advertisement")
+        model = TwoTowerModel(len(user_ids), len(product_ids), config.embedding_dim)
+        train_two_tower(model, dataset, config, device)
+        save_checkpoint(model, config, user_ids, product_ids)
+    index, indexed_product_ids = load_or_build_faiss_index(model, product_ids, config, device)
+    stream_two_tower_candidates(
+        model, user_ids, indexed_product_ids, index, config.output_path,
+        top_k=config.top_k, search_batch_size=config.search_batch_size, device=device,
     )
-    write_candidates(candidates, config.output_path)
-    return candidates
+    # Streaming intentionally leaves no full candidate dataframe resident.
+    return pd.DataFrame(columns=OUTPUT_COLUMNS).astype(
+        {"user_id": "string", "candidate_ad_id": "string", "two_tower_score": "float64", "rank": "int64"}
+    )
 
 
 def write_candidates(candidates: pd.DataFrame, output_path: Path) -> None:
@@ -446,7 +545,7 @@ def _select_device(requested: str) -> torch.device:
 
 
 def _validate_config(config: TwoTowerRecallConfig) -> None:
-    if min(config.embedding_dim, config.batch_size, config.epochs, config.top_k, config.negative_samples, config.inference_batch_size, config.input_chunk_size) <= 0:
+    if min(config.embedding_dim, config.batch_size, config.epochs, config.top_k, config.negative_samples, config.search_batch_size, config.inference_batch_size, config.input_chunk_size) <= 0:
         raise ValueError("Two Tower numeric configuration values must be greater than zero")
     if config.learning_rate <= 0:
         raise ValueError("recall.two_tower.learning_rate must be greater than zero")
@@ -456,6 +555,16 @@ def _validate_config(config: TwoTowerRecallConfig) -> None:
         raise ValueError("recall.two_tower.faiss.index_type must be 'flat' or 'hnsw'")
     if min(config.hnsw_m, config.ef_construction, config.ef_search) <= 0:
         raise ValueError("recall.two_tower.faiss HNSW values must be greater than zero")
+
+
+def _read_checkpoint(path: Path, device: torch.device) -> Mapping[str, Any]:
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError(f"Unable to load Two Tower checkpoint: {path}") from error
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("Two Tower checkpoint must be a mapping")
+    return checkpoint
 
 
 def _faiss_options(options: Mapping[str, Any]) -> Mapping[str, Any]:

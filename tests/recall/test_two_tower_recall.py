@@ -7,6 +7,8 @@ import pandas as pd
 import pytest
 import torch
 
+import search_ads_system.recall.two_tower_recall as two_tower_recall
+
 from search_ads_system.recall.faiss_index import (
     build_faiss_index,
     load_faiss_index,
@@ -20,7 +22,9 @@ from search_ads_system.recall.two_tower_recall import (
     generate_two_tower_candidates,
     load_checkpoint,
     prepare_training_data,
+    run_two_tower_recall,
     save_checkpoint,
+    stream_two_tower_candidates,
     write_candidates,
 )
 
@@ -57,6 +61,65 @@ def test_existing_checkpoint_is_loaded_without_retraining(tmp_path) -> None:
 def test_train_switch_defaults_to_inference(tmp_path) -> None:
     config = _config(tmp_path)
     assert config.train is False
+
+
+def test_streaming_retrieval_writes_each_batch_without_candidate_dataframe(tmp_path, monkeypatch) -> None:
+    class FakeIndex:
+        ntotal = 3
+
+    def fake_search(index, user_embeddings, top_k):
+        assert index.ntotal == 3
+        assert top_k == 2
+        return (
+            np.tile(np.asarray([0.9, 0.8], dtype=np.float32), (len(user_embeddings), 1)),
+            np.tile(np.asarray([0, 1], dtype=np.int64), (len(user_embeddings), 1)),
+        )
+
+    monkeypatch.setattr(two_tower_recall, "search_faiss_index", fake_search)
+    output_path = tmp_path / "two_tower_topk.csv"
+    rows_written = stream_two_tower_candidates(
+        TwoTowerModel(num_users=3, num_ads=3),
+        np.asarray(["u1", "u2", "u3"]),
+        np.asarray(["a1", "a2", "a3"]),
+        FakeIndex(),
+        output_path,
+        top_k=2,
+        search_batch_size=2,
+        device=torch.device("cpu"),
+    )
+    written = pd.read_csv(output_path)
+    assert rows_written == 6
+    assert written.columns.tolist() == list(OUTPUT_COLUMNS)
+    assert written.groupby("user_id")["rank"].apply(list).to_dict() == {
+        "u1": [1, 2], "u2": [1, 2], "u3": [1, 2]
+    }
+
+
+def test_inference_mode_uses_checkpoint_and_existing_index_without_loading_interactions(tmp_path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    model = TwoTowerModel(num_users=2, num_ads=3)
+    user_ids = np.asarray(["u1", "u2"])
+    product_ids = np.asarray(["a1", "a2", "a3"])
+    save_checkpoint(model, config, user_ids, product_ids)
+    calls = []
+
+    def interactions_must_not_be_loaded(_config):
+        raise AssertionError("inference mode must not load interactions")
+
+    def existing_index(_model, actual_product_ids, _config, _device):
+        calls.append("load_index")
+        return object(), actual_product_ids
+
+    def streamed(_model, actual_user_ids, actual_product_ids, _index, _output, **kwargs):
+        calls.append((actual_user_ids.tolist(), actual_product_ids.tolist(), kwargs["search_batch_size"]))
+        return 4
+
+    monkeypatch.setattr(two_tower_recall, "load_interactions", interactions_must_not_be_loaded)
+    monkeypatch.setattr(two_tower_recall, "load_or_build_faiss_index", existing_index)
+    monkeypatch.setattr(two_tower_recall, "stream_two_tower_candidates", streamed)
+    result = run_two_tower_recall(config)
+    assert result.empty
+    assert calls == ["load_index", (["u1", "u2"], ["a1", "a2", "a3"], 10_000)]
 
 
 def test_faiss_index_can_be_built_and_searched() -> None:

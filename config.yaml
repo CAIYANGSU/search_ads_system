@@ -101,6 +101,8 @@ recall:
     # false: infer from an existing checkpoint; true: force a retraining run.
     # If no checkpoint exists, a first training run is performed automatically.
     train: false
+    # Bounded-memory FAISS inference and CSV writing batch size.
+    search_batch_size: 10000
     faiss:
       index_type: hnsw
       hnsw_m: 32
