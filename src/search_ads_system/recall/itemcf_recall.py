@@ -131,13 +131,21 @@ def prepare_interactions(
         :, [config.user_id_column, config.item_id_column, config.interaction_label_column]
     ].copy()
     prepared.columns = ["user_id", "item_id", "interaction_label"]
-    if prepared[["user_id", "item_id"]].isna().any().any():
-        raise ValueError("Interaction data contains missing user_id or item/ad_id values")
-
+    raw_interaction_count = len(prepared)
     prepared["user_id"] = prepared["user_id"].astype("string").str.strip()
     prepared["item_id"] = prepared["item_id"].astype("string").str.strip()
-    if (prepared[["user_id", "item_id"]] == "").any().any():
-        raise ValueError("Interaction data contains blank user_id or item/ad_id values")
+    has_required_ids = (
+        prepared[["user_id", "item_id"]].notna().all(axis=1)
+        & prepared[["user_id", "item_id"]].ne("").all(axis=1)
+    )
+    dropped_interaction_count = int((~has_required_ids).sum())
+    prepared = prepared.loc[has_required_ids].copy()
+    LOGGER.info(
+        "Interaction ID cleaning: raw_interactions=%s dropped_interactions=%s remaining_interactions=%s",
+        raw_interaction_count,
+        dropped_interaction_count,
+        len(prepared),
+    )
 
     label_keys = prepared["interaction_label"].map(_normalise_label_key)
     prepared["interaction_weight"] = label_keys.map(config.label_weights).fillna(

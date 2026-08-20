@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -66,3 +67,24 @@ def test_itemcf_writes_documented_csv_schema(tmp_path: Path) -> None:
     written = pd.read_csv(output_path)
     assert written.columns.tolist() == ["user_id", "candidate_ad_id", "itemcf_score", "rank"]
     assert output_path.is_file()
+
+
+def test_itemcf_drops_missing_user_or_item_ids_without_failing(tmp_path: Path, caplog) -> None:
+    interactions = pd.DataFrame(
+        [
+            ("u1", "a", "click"),
+            ("u1", "b", "click"),
+            ("u2", "a", "click"),
+            ("u2", "c", "click"),
+            (None, "d", "click"),
+            ("u3", None, "click"),
+            ("  ", "e", "click"),
+        ],
+        columns=["user_id", "ad_id", "interaction_label"],
+    )
+
+    with caplog.at_level(logging.INFO, logger="search_ads_system.recall.itemcf_recall"):
+        candidates = generate_itemcf_candidates(interactions, _config(tmp_path))
+
+    assert candidates.loc[candidates["user_id"] == "u1", "candidate_ad_id"].tolist() == ["c"]
+    assert "raw_interactions=7 dropped_interactions=3 remaining_interactions=4" in caplog.text
