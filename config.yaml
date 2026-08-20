@@ -82,6 +82,23 @@ training:
 recall:
   model: itemcf
   top_k: 200
+  two_tower:
+    input_path: outputs/processed/criteo_unified
+    output_path: outputs/recall_candidates/two_tower_topk.csv
+    index_path: outputs/recall_candidates/faiss_ad_index
+    checkpoint_path: outputs/recall_candidates/two_tower_checkpoint.pt
+    embedding_dim: 64
+    batch_size: 4096
+    epochs: 3
+    learning_rate: 0.001
+    top_k: 200
+    negative_samples: 5
+    interaction_weights:
+      click: 1.0
+      conversion: 3.0
+    # auto selects CUDA when PyTorch detects it, otherwise CPU.
+    device: auto
+    index_type: flat
   itemcf:
     # A file or a directory containing headered CSV interaction records.
     # The default uses the project's unified Criteo click/conversion output.
