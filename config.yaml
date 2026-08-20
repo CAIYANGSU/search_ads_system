@@ -148,7 +148,8 @@ recall:
       itemcf: 1.0
       two_tower: 1.0
       popularity: 0.5
-    top_k_per_user: 200
+    top_k_per_user: 100
+    max_users: 500000
 
 prerank:
   model: placeholder
