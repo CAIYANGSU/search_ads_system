@@ -98,7 +98,13 @@ recall:
       conversion: 3.0
     # auto selects CUDA when PyTorch detects it, otherwise CPU.
     device: auto
-    index_type: flat
+    # Existing checkpoints are reused by default so ANN recall does not retrain.
+    reuse_checkpoint: true
+    faiss:
+      index_type: hnsw
+      hnsw_m: 32
+      ef_construction: 200
+      ef_search: 64
   itemcf:
     # A file or a directory containing headered CSV interaction records.
     # The default uses the project's unified Criteo click/conversion output.

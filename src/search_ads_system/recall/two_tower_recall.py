@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import random
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,11 @@ from torch.nn import functional as functional
 from torch.utils.data import DataLoader, Dataset
 
 from search_ads_system.common.config import load_yaml_config, resolve_path
-from search_ads_system.recall.faiss_index import build_faiss_index, save_faiss_index, search_faiss_index
+from search_ads_system.recall.faiss_index import (
+    build_faiss_index,
+    save_faiss_index,
+    search_faiss_index,
+)
 
 LOGGER = logging.getLogger(__name__)
 OUTPUT_COLUMNS = ("user_id", "candidate_ad_id", "two_tower_score", "rank")
@@ -43,7 +48,11 @@ class TwoTowerRecallConfig:
     conversion_weight: float = 3.0
     seed: int = 2026
     device: str = "auto"
-    index_type: str = "flat"
+    faiss_index_type: str = "hnsw"
+    hnsw_m: int = 32
+    ef_construction: int = 200
+    ef_search: int = 64
+    reuse_checkpoint: bool = True
     inference_batch_size: int = 4096
     input_chunk_size: int = 200_000
 
@@ -151,7 +160,12 @@ def parse_two_tower_config(raw_config: Mapping[str, Any], config_path: Path) -> 
         click_weight=float(raw_weights.get("click", options.get("click_weight", 1.0))),
         conversion_weight=float(raw_weights.get("conversion", options.get("conversion_weight", 3.0))),
         seed=int(options.get("seed", raw_config.get("project", {}).get("seed", 2026))),
-        device=str(options.get("device", "auto")), index_type=str(options.get("index_type", "flat")),
+        device=str(options.get("device", "auto")),
+        faiss_index_type=str(_faiss_options(options).get("index_type", "hnsw")),
+        hnsw_m=int(_faiss_options(options).get("hnsw_m", 32)),
+        ef_construction=int(_faiss_options(options).get("ef_construction", 200)),
+        ef_search=int(_faiss_options(options).get("ef_search", 64)),
+        reuse_checkpoint=bool(options.get("reuse_checkpoint", True)),
         inference_batch_size=int(options.get("inference_batch_size", 4096)),
         input_chunk_size=int(options.get("input_chunk_size", 200_000)),
     )
@@ -273,6 +287,7 @@ def generate_two_tower_candidates(
 
     if top_k <= 0:
         raise ValueError("top_k must be greater than zero")
+    started_at = time.monotonic()
     rows: list[tuple[str, str, float, int]] = []
     if query_batch_size <= 0:
         raise ValueError("query_batch_size must be greater than zero")
@@ -293,6 +308,13 @@ def generate_two_tower_candidates(
                 rows.append((str(user_id), str(product_ids[int(ad_position)]), float(score), rank))
                 if rank == top_k:
                     break
+    elapsed_seconds = time.monotonic() - started_at
+    LOGGER.info(
+        "FAISS search benchmark: search users=%s total search time=%.2f seconds users/sec=%.2f",
+        len(user_ids),
+        elapsed_seconds,
+        len(user_ids) / elapsed_seconds if elapsed_seconds else 0.0,
+    )
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS).astype(
         {"user_id": "string", "candidate_ad_id": "string", "two_tower_score": "float64", "rank": "int64"}
     )
@@ -306,6 +328,31 @@ def save_checkpoint(model: TwoTowerModel, config: TwoTowerRecallConfig, user_ids
     LOGGER.info("Saved Two Tower checkpoint to %s", config.checkpoint_path)
 
 
+def load_checkpoint(config: TwoTowerRecallConfig, user_ids: np.ndarray, product_ids: np.ndarray, device: torch.device) -> TwoTowerModel:
+    """Load a trained tower and verify it matches the current data vocabularies."""
+
+    try:
+        checkpoint = torch.load(config.checkpoint_path, map_location=device, weights_only=False)
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError(f"Unable to load Two Tower checkpoint: {config.checkpoint_path}") from error
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("Two Tower checkpoint must be a mapping")
+    checkpoint_users = np.asarray(checkpoint.get("user_ids", []), dtype=str)
+    checkpoint_products = np.asarray(checkpoint.get("product_ids", []), dtype=str)
+    if not np.array_equal(checkpoint_users, user_ids) or not np.array_equal(checkpoint_products, product_ids):
+        raise ValueError(
+            "Checkpoint vocabularies do not match the current interactions; set reuse_checkpoint=false to retrain"
+        )
+    embedding_dim = int(checkpoint.get("embedding_dim", config.embedding_dim))
+    if embedding_dim != config.embedding_dim:
+        raise ValueError("Checkpoint embedding_dim does not match recall.two_tower.embedding_dim")
+    model = TwoTowerModel(len(user_ids), len(product_ids), embedding_dim)
+    model.load_state_dict(checkpoint["state_dict"])
+    model.to(device)
+    LOGGER.info("Loaded existing Two Tower checkpoint from %s; training skipped", config.checkpoint_path)
+    return model
+
+
 def run_two_tower_recall(config: TwoTowerRecallConfig) -> pd.DataFrame:
     """Execute data preparation, training, index creation, and offline recall."""
 
@@ -317,16 +364,35 @@ def run_two_tower_recall(config: TwoTowerRecallConfig) -> pd.DataFrame:
     LOGGER.info("Training sample statistics: %s", stats)
     if not len(user_ids) or not len(product_ids):
         raise ValueError("No valid interactions available for Two Tower training")
-    dataset = NegativeSamplingDataset(user_codes, ad_codes, weights, histories, len(product_ids), config.negative_samples, config.seed)
-    if not len(dataset):
-        raise ValueError("Cannot sample negatives: every user has interacted with every advertisement")
-    model = TwoTowerModel(len(user_ids), len(product_ids), config.embedding_dim)
-    train_two_tower(model, dataset, config, device)
-    save_checkpoint(model, config, user_ids, product_ids)
+    if config.reuse_checkpoint and config.checkpoint_path.is_file():
+        model = load_checkpoint(config, user_ids, product_ids, device)
+    else:
+        dataset = NegativeSamplingDataset(
+            user_codes, ad_codes, weights, histories, len(product_ids), config.negative_samples, config.seed
+        )
+        if not len(dataset):
+            raise ValueError("Cannot sample negatives: every user has interacted with every advertisement")
+        model = TwoTowerModel(len(user_ids), len(product_ids), config.embedding_dim)
+        train_two_tower(model, dataset, config, device)
+        save_checkpoint(model, config, user_ids, product_ids)
     ad_embeddings = extract_embeddings(model, len(product_ids), "ad", config.inference_batch_size, device)
-    index = build_faiss_index(ad_embeddings, config.index_type)
+    index_started_at = time.monotonic()
+    index = build_faiss_index(
+        ad_embeddings,
+        config.faiss_index_type,
+        hnsw_m=config.hnsw_m,
+        ef_construction=config.ef_construction,
+        ef_search=config.ef_search,
+    )
+    index_build_seconds = time.monotonic() - index_started_at
     save_faiss_index(index, product_ids, config.index_path)
-    LOGGER.info("Built and saved FAISS %s cosine index: ads=%s path=%s", config.index_type, index.ntotal, config.index_path)
+    LOGGER.info(
+        "FAISS index build benchmark: index_type=%s ads=%s index build time=%.2f seconds path=%s",
+        config.faiss_index_type,
+        index.ntotal,
+        index_build_seconds,
+        config.index_path,
+    )
     user_embeddings = extract_embeddings(model, len(user_ids), "user", config.inference_batch_size, device)
     candidates = generate_two_tower_candidates(
         user_ids, user_embeddings, product_ids, index, histories, config.top_k, config.inference_batch_size
@@ -380,8 +446,19 @@ def _validate_config(config: TwoTowerRecallConfig) -> None:
         raise ValueError("recall.two_tower.learning_rate must be greater than zero")
     if config.click_weight <= 0 or config.conversion_weight <= 0:
         raise ValueError("recall.two_tower interaction weights must be greater than zero")
-    if config.index_type.lower() not in {"flat", "hnsw"}:
-        raise ValueError("recall.two_tower.index_type must be 'flat' or 'hnsw'")
+    if config.faiss_index_type.lower() not in {"flat", "hnsw"}:
+        raise ValueError("recall.two_tower.faiss.index_type must be 'flat' or 'hnsw'")
+    if min(config.hnsw_m, config.ef_construction, config.ef_search) <= 0:
+        raise ValueError("recall.two_tower.faiss HNSW values must be greater than zero")
+
+
+def _faiss_options(options: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Read FAISS options, accepting legacy index_type for a smooth upgrade."""
+
+    faiss_options = options.get("faiss", {})
+    if not isinstance(faiss_options, Mapping):
+        raise ValueError("recall.two_tower.faiss configuration must be a mapping")
+    return {"index_type": options.get("index_type", "hnsw"), **faiss_options}
 
 
 def main() -> None:

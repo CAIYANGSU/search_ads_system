@@ -7,13 +7,20 @@ import pandas as pd
 import pytest
 import torch
 
-from search_ads_system.recall.faiss_index import build_faiss_index, search_faiss_index
+from search_ads_system.recall.faiss_index import (
+    build_faiss_index,
+    load_faiss_index,
+    save_faiss_index,
+    search_faiss_index,
+)
 from search_ads_system.recall.two_tower_recall import (
     OUTPUT_COLUMNS,
     TwoTowerModel,
     TwoTowerRecallConfig,
     generate_two_tower_candidates,
+    load_checkpoint,
     prepare_training_data,
+    save_checkpoint,
     write_candidates,
 )
 
@@ -34,13 +41,46 @@ def test_two_tower_forward_and_embedding_shapes() -> None:
     assert torch.allclose(user_vectors.norm(dim=1), torch.ones(2), atol=1e-5)
 
 
+def test_existing_checkpoint_is_loaded_without_retraining(tmp_path) -> None:
+    config = _config(tmp_path)
+    model = TwoTowerModel(num_users=2, num_ads=3, embedding_dim=64)
+    user_ids = np.asarray(["u1", "u2"])
+    product_ids = np.asarray(["a1", "a2", "a3"])
+    expected_users, expected_ads = model(torch.tensor([0]), torch.tensor([1]))
+    save_checkpoint(model, config, user_ids, product_ids)
+    restored = load_checkpoint(config, user_ids, product_ids, torch.device("cpu"))
+    actual_users, actual_ads = restored(torch.tensor([0]), torch.tensor([1]))
+    assert torch.allclose(actual_users, expected_users)
+    assert torch.allclose(actual_ads, expected_ads)
+
+
 def test_faiss_index_can_be_built_and_searched() -> None:
     pytest.importorskip("faiss")
-    index = build_faiss_index(np.eye(3, dtype=np.float32))
-    scores, positions = search_faiss_index(index, np.array([[1, 0, 0]], dtype=np.float32), top_k=2)
+    index = build_faiss_index(np.eye(3, dtype=np.float32), "hnsw", hnsw_m=32, ef_construction=200, ef_search=64)
+    scores, positions = search_faiss_index(
+        index, np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32), top_k=2
+    )
     assert index.ntotal == 3
-    assert positions.tolist() == [[0, 1]]
+    assert positions.shape == (2, 2)
+    assert scores.shape == (2, 2)
+    assert positions[0, 0] == 0
     assert scores[0, 0] == 1.0
+
+
+def test_faiss_save_load_preserves_search_results(tmp_path) -> None:
+    pytest.importorskip("faiss")
+    embeddings = np.eye(4, dtype=np.float32)
+    product_ids = np.asarray(["a1", "a2", "a3", "a4"])
+    queries = np.asarray([[1, 0, 0, 0], [0, 0, 1, 0]], dtype=np.float32)
+    index = build_faiss_index(embeddings, "hnsw", hnsw_m=32, ef_construction=200, ef_search=64)
+    before_scores, before_positions = search_faiss_index(index, queries, top_k=2)
+    path = tmp_path / "faiss_ad_index"
+    save_faiss_index(index, product_ids, path)
+    restored, restored_ids = load_faiss_index(path)
+    after_scores, after_positions = search_faiss_index(restored, queries, top_k=2)
+    assert restored_ids.tolist() == product_ids.tolist()
+    assert np.array_equal(after_positions, before_positions)
+    assert np.allclose(after_scores, before_scores)
 
 
 def test_candidate_output_schema_and_seen_ad_filtering(tmp_path) -> None:

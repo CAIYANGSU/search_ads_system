@@ -36,11 +36,19 @@ def normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
     return vectors
 
 
-def build_faiss_index(embeddings: np.ndarray, index_type: str = "flat") -> faiss.Index:
+def build_faiss_index(
+    embeddings: np.ndarray,
+    index_type: str = "flat",
+    *,
+    hnsw_m: int = 32,
+    ef_construction: int = 200,
+    ef_search: int = 64,
+) -> faiss.Index:
     """Build a cosine-similarity FAISS index from advertisement embeddings.
 
-    ``flat`` is exact ``IndexFlatIP``. ``hnsw`` uses HNSW with inner product;
-    both are cosine indexes because vectors are normalized before insertion.
+    ``flat`` is exact ``IndexFlatIP``. ``hnsw`` uses ``IndexHNSWFlat`` with
+    inner product; both are cosine indexes because vectors are normalized
+    before insertion.
     """
 
     _require_faiss()
@@ -51,9 +59,11 @@ def build_faiss_index(embeddings: np.ndarray, index_type: str = "flat") -> faiss
     if kind == "flat":
         index: faiss.Index = faiss.IndexFlatIP(vectors.shape[1])
     elif kind == "hnsw":
-        index = faiss.IndexHNSWFlat(vectors.shape[1], 32, faiss.METRIC_INNER_PRODUCT)
-        index.hnsw.efConstruction = 80
-        index.hnsw.efSearch = 64
+        if min(hnsw_m, ef_construction, ef_search) <= 0:
+            raise ValueError("HNSW M, ef_construction, and ef_search must be greater than zero")
+        index = faiss.IndexHNSWFlat(vectors.shape[1], hnsw_m, faiss.METRIC_INNER_PRODUCT)
+        index.hnsw.efConstruction = ef_construction
+        index.hnsw.efSearch = ef_search
     else:
         raise ValueError("index_type must be 'flat' or 'hnsw'")
     index.add(vectors)
