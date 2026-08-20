@@ -98,8 +98,9 @@ recall:
       conversion: 3.0
     # auto selects CUDA when PyTorch detects it, otherwise CPU.
     device: auto
-    # Existing checkpoints are reused by default so ANN recall does not retrain.
-    reuse_checkpoint: true
+    # false: infer from an existing checkpoint; true: force a retraining run.
+    # If no checkpoint exists, a first training run is performed automatically.
+    train: false
     faiss:
       index_type: hnsw
       hnsw_m: 32

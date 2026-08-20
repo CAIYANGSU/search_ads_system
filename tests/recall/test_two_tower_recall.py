@@ -54,6 +54,11 @@ def test_existing_checkpoint_is_loaded_without_retraining(tmp_path) -> None:
     assert torch.allclose(actual_ads, expected_ads)
 
 
+def test_train_switch_defaults_to_inference(tmp_path) -> None:
+    config = _config(tmp_path)
+    assert config.train is False
+
+
 def test_faiss_index_can_be_built_and_searched() -> None:
     pytest.importorskip("faiss")
     index = build_faiss_index(np.eye(3, dtype=np.float32), "hnsw", hnsw_m=32, ef_construction=200, ef_search=64)

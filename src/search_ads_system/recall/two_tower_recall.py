@@ -52,7 +52,7 @@ class TwoTowerRecallConfig:
     hnsw_m: int = 32
     ef_construction: int = 200
     ef_search: int = 64
-    reuse_checkpoint: bool = True
+    train: bool = False
     inference_batch_size: int = 4096
     input_chunk_size: int = 200_000
 
@@ -165,7 +165,9 @@ def parse_two_tower_config(raw_config: Mapping[str, Any], config_path: Path) -> 
         hnsw_m=int(_faiss_options(options).get("hnsw_m", 32)),
         ef_construction=int(_faiss_options(options).get("ef_construction", 200)),
         ef_search=int(_faiss_options(options).get("ef_search", 64)),
-        reuse_checkpoint=bool(options.get("reuse_checkpoint", True)),
+        # ``train`` is the public inference/training switch.  The fallback
+        # retains support for configs written before this option existed.
+        train=bool(options.get("train", not bool(options.get("reuse_checkpoint", True)))),
         inference_batch_size=int(options.get("inference_batch_size", 4096)),
         input_chunk_size=int(options.get("input_chunk_size", 200_000)),
     )
@@ -364,9 +366,13 @@ def run_two_tower_recall(config: TwoTowerRecallConfig) -> pd.DataFrame:
     LOGGER.info("Training sample statistics: %s", stats)
     if not len(user_ids) or not len(product_ids):
         raise ValueError("No valid interactions available for Two Tower training")
-    if config.reuse_checkpoint and config.checkpoint_path.is_file():
+    if not config.train and config.checkpoint_path.is_file():
         model = load_checkpoint(config, user_ids, product_ids, device)
     else:
+        if not config.train:
+            LOGGER.info("No existing checkpoint at %s; training Two Tower model", config.checkpoint_path)
+        else:
+            LOGGER.info("Two Tower training forced by recall.two_tower.train=true")
         dataset = NegativeSamplingDataset(
             user_codes, ad_codes, weights, histories, len(product_ids), config.negative_samples, config.seed
         )
