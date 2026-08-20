@@ -17,7 +17,7 @@ preprocessing:
   # This contract is transcribed from the dataset's bundled README. The source
   # file itself has no header, so the ordered names must be supplied explicitly.
   dataset:
-    path: criteo_search_conversion/Criteo_Conversion_Search/CriteoSearchData
+    path: data/raw/Criteo_Conversion_Search/CriteoSearchData
     delimiter: "\t"
     has_header: false
     encoding: utf-8
