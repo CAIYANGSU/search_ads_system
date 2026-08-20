@@ -69,6 +69,7 @@ preprocessing:
       - audience_id
       - product_id
       - partner_id
+      - user_id
     missing_category_token: __MISSING__
 
 training:
