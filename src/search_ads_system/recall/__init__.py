@@ -6,6 +6,7 @@ from search_ads_system.recall.itemcf_recall import (
     compute_item_similarity,
     generate_itemcf_candidates,
 )
+from search_ads_system.recall.popularity_recall import PopularityRecallConfig, generate_popularity_candidates
 from search_ads_system.recall.two_tower_recall import TwoTowerModel, TwoTowerRecallConfig, run_two_tower_recall
 
 __all__ = [
@@ -13,6 +14,8 @@ __all__ = [
     "build_user_item_matrix",
     "compute_item_similarity",
     "generate_itemcf_candidates",
+    "PopularityRecallConfig",
+    "generate_popularity_candidates",
     "TwoTowerModel",
     "TwoTowerRecallConfig",
     "run_two_tower_recall",

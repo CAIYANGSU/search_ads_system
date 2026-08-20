@@ -82,6 +82,13 @@ training:
 recall:
   model: itemcf
   top_k: 200
+  popularity:
+    input_path: outputs/processed/criteo_unified
+    output_path: outputs/recall_candidates/popularity_topk.csv
+    top_k: 200
+    click_weight: 1.0
+    conversion_weight: 3.0
+    chunk_size: 200000
   two_tower:
     input_path: outputs/processed/criteo_unified
     output_path: outputs/recall_candidates/two_tower_topk.csv
