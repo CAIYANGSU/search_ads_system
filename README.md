@@ -111,3 +111,13 @@ PYTHONPATH=src python3.12 -m pytest tests/data/test_criteo_pipeline.py
 ```
 
 该测试用两行临时 Criteo 格式数据覆盖分块转换、EDA 与特征工程，不会读取或写入真实数据集。
+
+## ItemCF Recall
+
+首条多路召回为 ItemCF，仅根据用户历史商品广告交互生成候选；它不包含 Two Tower、FAISS、RRF 或排序逻辑。默认读取 `outputs/processed/criteo_unified/` 的分块 CSV，把 `product_id` 作为广告 ID，并将所有点击作为隐式交互，同时在 `conversion_label=1` 时给予更高权重。所有字段、权重、TopK、输入和输出路径都在 `config.yaml` 的 `recall.itemcf` 中配置。
+
+```bash
+python3.12 src/pipeline/run_itemcf_recall.py --config config.yaml
+```
+
+输出为 `outputs/recall_candidates/itemcf_topk.csv`，列为 `user_id`、`candidate_ad_id`、`itemcf_score` 与从 1 开始的 `rank`。已交互广告不会被回召。

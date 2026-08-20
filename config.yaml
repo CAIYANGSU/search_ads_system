@@ -80,12 +80,26 @@ training:
   device: auto
 
 recall:
-  model: two_tower
-  embedding_dim: 128
+  model: itemcf
   top_k: 200
-  ann:
-    index_type: flat
-    metric: inner_product
+  itemcf:
+    # A file or a directory containing headered CSV interaction records.
+    # The default uses the project's unified Criteo click/conversion output.
+    input_path: outputs/processed/criteo_unified
+    output_path: outputs/recall_candidates/itemcf_topk.csv
+    user_id_column: user_id
+    item_id_column: product_id
+    interaction_label_column: conversion_label
+    # Every input row is a click interaction in the unified Criteo data. A
+    # conversion receives more weight while non-converting clicks remain valid
+    # implicit-feedback interactions.
+    interaction_label_weights:
+      "0": 1.0
+      "1": 3.0
+    default_interaction_weight: 1.0
+    interaction_aggregation: sum
+    similarity: cosine
+    input_chunk_size: 200000
 
 prerank:
   model: placeholder
