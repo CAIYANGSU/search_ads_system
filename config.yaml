@@ -91,7 +91,8 @@ recall:
     batch_size: 4096
     epochs: 3
     learning_rate: 0.001
-    top_k: 200
+    top_k: 100
+    max_users: 500000
     negative_samples: 5
     interaction_weights:
       click: 1.0

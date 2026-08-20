@@ -84,6 +84,7 @@ def test_streaming_retrieval_writes_each_batch_without_candidate_dataframe(tmp_p
         FakeIndex(),
         output_path,
         top_k=2,
+        max_users=None,
         search_batch_size=2,
         device=torch.device("cpu"),
     )
@@ -93,6 +94,37 @@ def test_streaming_retrieval_writes_each_batch_without_candidate_dataframe(tmp_p
     assert written.groupby("user_id")["rank"].apply(list).to_dict() == {
         "u1": [1, 2], "u2": [1, 2], "u3": [1, 2]
     }
+
+
+def test_streaming_retrieval_respects_max_users(tmp_path, monkeypatch) -> None:
+    class FakeIndex:
+        ntotal = 2
+
+    def fake_search(_index, user_embeddings, top_k):
+        assert top_k == 2
+        return (
+            np.ones((len(user_embeddings), 2), dtype=np.float32),
+            np.tile(np.asarray([0, 1], dtype=np.int64), (len(user_embeddings), 1)),
+        )
+
+    monkeypatch.setattr(two_tower_recall, "search_faiss_index", fake_search)
+    user_ids = np.asarray([f"u{number}" for number in range(12)])
+    output_path = tmp_path / "two_tower_topk.csv"
+    rows_written = stream_two_tower_candidates(
+        TwoTowerModel(num_users=12, num_ads=2),
+        user_ids,
+        np.asarray(["a1", "a2"]),
+        FakeIndex(),
+        output_path,
+        top_k=2,
+        max_users=10,
+        search_batch_size=4,
+        device=torch.device("cpu"),
+    )
+    written = pd.read_csv(output_path)
+    assert rows_written == 20
+    assert written["user_id"].nunique() == 10
+    assert written["user_id"].unique().tolist() == user_ids[:10].tolist()
 
 
 def test_inference_mode_uses_checkpoint_and_existing_index_without_loading_interactions(tmp_path, monkeypatch) -> None:

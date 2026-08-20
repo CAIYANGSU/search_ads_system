@@ -10,7 +10,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -55,6 +55,7 @@ class TwoTowerRecallConfig:
     ef_construction: int = 200
     ef_search: int = 64
     train: bool = False
+    max_users: Optional[int] = None
     search_batch_size: int = 10_000
     inference_batch_size: int = 4096
     input_chunk_size: int = 200_000
@@ -148,6 +149,7 @@ def parse_two_tower_config(raw_config: Mapping[str, Any], config_path: Path) -> 
     raw_weights = options.get("interaction_weights", {})
     if not isinstance(raw_weights, Mapping):
         raise ValueError("recall.two_tower.interaction_weights must be a mapping")
+    raw_max_users = options.get("max_users")
     config = TwoTowerRecallConfig(
         input_path=resolve_path(str(options.get("input_path", paths["unified_data"])), root),
         output_path=resolve_path(str(options.get("output_path", "outputs/recall_candidates/two_tower_topk.csv")), root),
@@ -171,6 +173,7 @@ def parse_two_tower_config(raw_config: Mapping[str, Any], config_path: Path) -> 
         # ``train`` is the public inference/training switch.  The fallback
         # retains support for configs written before this option existed.
         train=bool(options.get("train", not bool(options.get("reuse_checkpoint", True)))),
+        max_users=None if raw_max_users is None else int(raw_max_users),
         search_batch_size=int(options.get("search_batch_size", 10_000)),
         inference_batch_size=int(options.get("inference_batch_size", 4096)),
         input_chunk_size=int(options.get("input_chunk_size", 200_000)),
@@ -417,6 +420,7 @@ def stream_two_tower_candidates(
     output_path: Path,
     *,
     top_k: int,
+    max_users: Optional[int],
     search_batch_size: int,
     device: torch.device,
 ) -> int:
@@ -429,6 +433,9 @@ def stream_two_tower_candidates(
 
     if top_k <= 0 or search_batch_size <= 0:
         raise ValueError("top_k and search_batch_size must be greater than zero")
+    total_users = len(user_ids)
+    selected_user_ids = user_ids if max_users is None else user_ids[:max_users]
+    LOGGER.info("Selected users=%s/%s", len(selected_user_ids), total_users)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
     started_at = time.monotonic()
@@ -438,12 +445,12 @@ def stream_two_tower_candidates(
     with temporary_path.open("w", newline="", encoding="utf-8") as output_file:
         writer = csv.writer(output_file)
         writer.writerow(OUTPUT_COLUMNS)
-        for start in range(0, len(user_ids), search_batch_size):
-            stop = min(start + search_batch_size, len(user_ids))
+        for start in range(0, len(selected_user_ids), search_batch_size):
+            stop = min(start + search_batch_size, len(selected_user_ids))
             user_indices = torch.arange(start, stop, device=device)
             user_embeddings = model.encode_users(user_indices).cpu().numpy().astype(np.float32, copy=False)
             scores, positions = search_faiss_index(index, user_embeddings, top_k)
-            for relative_position, user_id in enumerate(user_ids[start:stop]):
+            for relative_position, user_id in enumerate(selected_user_ids[start:stop]):
                 for rank, (score, ad_position) in enumerate(
                     zip(scores[relative_position], positions[relative_position], strict=True), start=1
                 ):
@@ -498,7 +505,8 @@ def run_two_tower_recall(config: TwoTowerRecallConfig) -> pd.DataFrame:
     index, indexed_product_ids = load_or_build_faiss_index(model, product_ids, config, device)
     stream_two_tower_candidates(
         model, user_ids, indexed_product_ids, index, config.output_path,
-        top_k=config.top_k, search_batch_size=config.search_batch_size, device=device,
+        top_k=config.top_k, max_users=config.max_users,
+        search_batch_size=config.search_batch_size, device=device,
     )
     # Streaming intentionally leaves no full candidate dataframe resident.
     return pd.DataFrame(columns=OUTPUT_COLUMNS).astype(
@@ -555,6 +563,8 @@ def _validate_config(config: TwoTowerRecallConfig) -> None:
         raise ValueError("recall.two_tower.faiss.index_type must be 'flat' or 'hnsw'")
     if min(config.hnsw_m, config.ef_construction, config.ef_search) <= 0:
         raise ValueError("recall.two_tower.faiss HNSW values must be greater than zero")
+    if config.max_users is not None and config.max_users <= 0:
+        raise ValueError("recall.two_tower.max_users must be greater than zero when set")
 
 
 def _read_checkpoint(path: Path, device: torch.device) -> Mapping[str, Any]:
