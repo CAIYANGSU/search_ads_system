@@ -141,6 +141,14 @@ recall:
       max_users: 1000000
     candidate_generation:
       user_batch_size: 10000
+  rrf:
+    k: 60
+    output_path: outputs/recall_candidates/fused_candidates.csv
+    weights:
+      itemcf: 1.0
+      two_tower: 1.0
+      popularity: 0.5
+    top_k_per_user: 200
 
 prerank:
   model: placeholder
