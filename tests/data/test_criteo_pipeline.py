@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from search_ads_system.data.conversion import convert_criteo_to_unified
 from search_ads_system.data.eda import run_eda
@@ -25,7 +27,7 @@ SOURCE_COLUMNS = (
 def test_conversion_eda_and_features_streaming(tmp_path: Path) -> None:
     raw_file = tmp_path / "CriteoSearchData.tsv"
     row_one = [
-        "0", "-1", "-1", "1598891820", "-1", "0.0", "-1", "mobile", "-1", "-1", "-1",
+        "0", "-1", "-1", "0", "-1", "0.0", "-1", "mobile", "-1", "-1", "-1",
         "-1", "-1", "-1", "-1", "-1", "-1", "-1", "FR", "product-a", "title-a", "partner-a", "user-a",
     ]
     row_two = [
@@ -73,10 +75,47 @@ def test_conversion_eda_and_features_streaming(tmp_path: Path) -> None:
         unified_path,
         feature_path,
         metadata_path,
-        FeatureConfig(categorical_columns=("device_type", "product_country"), missing_category_token="__MISSING__"),
+        FeatureConfig(
+            categorical_columns=(
+                "device_type",
+                "product_age_group",
+                "product_gender",
+                "product_brand",
+                "product_country",
+                "product_category_1",
+                "product_category_2",
+                "product_category_3",
+                "product_category_4",
+                "audience_id",
+                "product_id",
+                "partner_id",
+            ),
+            missing_category_token="__MISSING__",
+        ),
         chunk_size=1,
     )
     assert result.rows_written == 2
     features = pd.concat(iter_csv_parts(feature_path, chunk_size=10), ignore_index=True)
-    assert {"click_hour_utc", "log1p_product_price", "cat_device_type"}.issubset(features.columns)
+    assert {
+        "click_hour_utc",
+        "log_product_price",
+        "log_clicks_last_7d",
+        "conversion_delay_hours",
+        "has_conversion_value",
+        "cat_device_type",
+        "cat_product_id",
+        "cat_partner_id",
+    }.issubset(features.columns)
+    assert "cat_product_category_6" not in features.columns
+    assert "cat_product_category_7" not in features.columns
+    assert features.loc[0, "conversion_value_eur"] == 0.0
+    assert features.loc[0, "has_conversion_value"] == 0
+    assert features.loc[1, "has_conversion_value"] == 1
+    assert features.loc[0, "conversion_delay_hours"] == 0.0
+    assert features.loc[1, "conversion_delay_hours"] == pytest.approx(1 / 60)
+    assert features.loc[1, "log_product_price"] == pytest.approx(math.log1p(20.0))
+    assert features.loc[1, "log_clicks_last_7d"] == pytest.approx(math.log1p(3.0))
+    assert features.loc[0, "click_hour_utc"] == 0
+    assert features.loc[0, "click_timestamp_missing"] == 1
+    assert features.loc[0, "cat_product_brand"] == "__MISSING__"
     assert json.loads(metadata_path.read_text(encoding="utf-8"))["feature_version"] == "1.0"

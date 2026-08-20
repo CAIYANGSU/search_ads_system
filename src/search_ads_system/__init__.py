@@ -1,1 +1,1 @@
-"""Search ads algorithm system package."""
+"""Product ads ranking system package."""

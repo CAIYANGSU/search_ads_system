@@ -1,4 +1,4 @@
-"""Streaming conversion from raw Criteo Search Conversion rows to canonical data."""
+"""Stream raw Criteo conversion rows into canonical product-ad event data."""
 
 from __future__ import annotations
 

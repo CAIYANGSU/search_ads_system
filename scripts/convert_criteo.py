@@ -1,4 +1,4 @@
-"""Convert raw Criteo Search Conversion data into the canonical event schema."""
+"""Convert raw Criteo conversion data into the canonical product-ad event schema."""
 
 from __future__ import annotations
 

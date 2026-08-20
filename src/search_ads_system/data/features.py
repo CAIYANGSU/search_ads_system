@@ -74,20 +74,28 @@ def engineer_features(chunk: pd.DataFrame, config: FeatureConfig) -> pd.DataFram
     if missing:
         raise ValueError(f"Unified data is missing feature columns: {sorted(missing)}")
 
-    features = chunk.loc[
-        :, ["event_id", "conversion_label", "conversion_value_eur", "conversion_delay_seconds"]
-    ].copy()
+    features = chunk.loc[:, ["event_id"]].copy()
+    features["conversion_label"] = pd.to_numeric(chunk["conversion_label"], errors="coerce").fillna(0).astype("int8")
+    conversion_value = pd.to_numeric(chunk["conversion_value_eur"], errors="coerce")
+    features["has_conversion_value"] = conversion_value.notna().astype("int8")
+    features["conversion_value_eur"] = conversion_value.fillna(0.0).astype("float32")
+    conversion_delay = pd.to_numeric(chunk["conversion_delay_seconds"], errors="coerce")
+    features["conversion_delay_seconds"] = conversion_delay.fillna(0.0).astype("float32")
+    features["conversion_delay_hours"] = (features["conversion_delay_seconds"] / 3600.0).astype("float32")
     timestamp = pd.to_numeric(chunk["click_timestamp"], errors="coerce")
     date_time = pd.to_datetime(timestamp, unit="s", utc=True, errors="coerce")
-    features["click_hour_utc"] = date_time.dt.hour.astype("Int8")
-    features["click_day_of_week_utc"] = date_time.dt.dayofweek.astype("Int8")
+    features["click_hour_utc"] = date_time.dt.hour.fillna(0).astype("int8")
+    features["click_day_of_week_utc"] = date_time.dt.dayofweek.fillna(0).astype("int8")
     features["click_timestamp_missing"] = timestamp.isna().astype("int8")
 
-    for source_column, feature_name in (("product_price", "product_price"), ("clicks_last_7d", "clicks_last_7d")):
+    for source_column, feature_name, log_feature_name in (
+        ("product_price", "product_price", "log_product_price"),
+        ("clicks_last_7d", "clicks_last_7d", "log_clicks_last_7d"),
+    ):
         values = pd.to_numeric(chunk[source_column], errors="coerce")
         features[f"{feature_name}_missing"] = values.isna().astype("int8")
         features[feature_name] = values.fillna(0.0).astype("float32")
-        features[f"log1p_{feature_name}"] = np.log1p(values.clip(lower=0).fillna(0.0)).astype("float32")
+        features[log_feature_name] = np.log1p(values.clip(lower=0).fillna(0.0)).astype("float32")
 
     for column in config.categorical_columns:
         features[f"cat_{column}"] = (

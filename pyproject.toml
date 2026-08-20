@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "search-ads-algorithm-system"
 version = "0.1.0"
-description = "Modular search and recommendation ads algorithm system"
+description = "Modular product ads ranking system"
 readme = "README.md"
 requires-python = ">=3.12"
 

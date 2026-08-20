@@ -76,7 +76,7 @@ def normalize_criteo_chunk(
     source_row_offset: int,
     config: DelimitedDatasetConfig,
 ) -> pd.DataFrame:
-    """Convert one Criteo Search Conversion chunk into the canonical schema.
+    """Convert one Criteo conversion chunk into the canonical product-ad schema.
 
     Raw missing-value indicators are converted to nullable values. The Criteo file
     does not expose a click identifier, so ``event_id`` is a stable identifier based
