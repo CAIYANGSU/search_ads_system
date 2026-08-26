@@ -101,13 +101,36 @@ def test_encoded_value_mask_is_only_positive_with_known_value() -> None:
 def test_dataset_cache_metadata_and_click_conditioned_rows(tmp_path: Path) -> None:
     config = _config(tmp_path)
     metadata = build_dataset(config)
-    assert metadata["row_count"] + metadata["validation_row_count"] == 4  # unmatched coarse candidate is not a fabricated negative
+    assert metadata["row_count"] + metadata["validation_row_count"] == 4  # direct observed clicks, not candidate overlap
     assert metadata["feature_version"]
+    assert metadata["dataset_construction_version"] == "observed-clicked-interactions-v2"
+    assert metadata["diagnostics"]["source_interaction_rows"] == 4
+    assert metadata["diagnostics"]["train_rows"] + metadata["diagnostics"]["validation_rows"] == 4
+    assert metadata["diagnostics"]["conversion_positive_rows"] == 2
+    assert metadata["diagnostics"]["valid_conversion_value_rows"] == 1
+    assert metadata["value_transform"]["version"] == "normalized-log1p-v1"
     assert build_dataset(config)["config_hash"] == metadata["config_hash"]
     rows = list(FineRankParquetDataset(config.cache_dir)) + list(FineRankParquetDataset(config.cache_dir.parent / "validation"))
     assert any(row["label"] == 0 for row in rows)
     assert any(row["label"] == 1 for row in rows)
     assert sum(row["value_mask"] for row in rows) == 1.0
+
+
+def test_observed_click_training_does_not_depend_on_coarse_candidate_overlap(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    pd.DataFrame([{"user_id": "nobody", "candidate_ad_id": "unobserved", "coarse_score": .1, "rank": 1}]).to_csv(config.input_path, index=False)
+    metadata = build_dataset(config)
+    assert metadata["row_count"] + metadata["validation_row_count"] == 4
+    assert metadata["diagnostics"]["filter_rows"]["observed_click_rows_after_required_fields"] == 4
+
+
+def test_extreme_value_head_is_clamped_before_expm1() -> None:
+    model = DCNv2MultiTask(dense_dim=len(DENSE_FEATURES), sparse_bucket_sizes=(17,) * len(SPARSE_FEATURES), embedding_dim=4, hidden_dims=(8,), num_cross_layers=1)
+    with torch.no_grad():
+        model.value_head.weight.zero_(); model.value_head.bias.fill_(1_000_000)
+    probability, predicted_log, predicted_value, expected = model.predict_with_log(torch.zeros(2, len(DENSE_FEATURES)), torch.zeros(2, len(SPARSE_FEATURES), dtype=torch.long), value_mean=0.0, value_std=1.0, prediction_log_min=0.0, prediction_log_max=20.0)
+    assert torch.isfinite(predicted_log).all() and torch.isfinite(predicted_value).all() and torch.isfinite(expected).all()
+    assert torch.all(predicted_value >= 0) and torch.allclose(expected, probability * predicted_value)
 
 
 def test_checkpoint_train_false_style_load_and_chunked_topk_inference(tmp_path: Path) -> None:
@@ -121,6 +144,8 @@ def test_checkpoint_train_false_style_load_and_chunked_topk_inference(tmp_path: 
     output = infer_fine_rank(config)
     ranked = pd.read_csv(config.output_path)
     assert output["output_rows"] == len(ranked)
+    assert output["prediction_diagnostics"]["nonfinite_values"] == 0
+    assert set(output["prediction_diagnostics"]["predicted_log_value"]) == {"min", "median", "p95", "p99", "max"}
     assert ranked.groupby("user_id").size().eq(2).all()
     assert ranked.groupby("user_id")["rank"].apply(lambda ranks: ranks.tolist() == [1, 2]).all()
     assert np.allclose(ranked.expected_value_score, ranked.pCVR * ranked.predicted_conversion_value)
@@ -140,13 +165,14 @@ def test_temporal_dataset_spec_isolated(tmp_path: Path) -> None:
 
 
 def test_temporal_uses_past_only_features_with_future_labels(tmp_path: Path) -> None:
-    past = tmp_path / "temporal" / "split" / "past"; future_a = tmp_path / "temporal" / "split" / "future_a"
-    past.mkdir(parents=True); future_a.mkdir(parents=True)
+    past = tmp_path / "temporal" / "split" / "past"; future_a = tmp_path / "temporal" / "split" / "future_a"; future_b = tmp_path / "temporal" / "split" / "future_b"
+    past.mkdir(parents=True); future_a.mkdir(parents=True); future_b.mkdir(parents=True)
     pd.DataFrame([{"user_id": "u", "product_id": "a", "conversion_label": 0, "conversion_value_eur": np.nan, "click_timestamp": 1, "product_price": 1.0, "clicks_last_7d": 1}]).to_csv(past / "part-00000.csv", index=False)
     pd.DataFrame([{"user_id": "u", "product_id": "a", "conversion_label": 1, "conversion_value_eur": 9.0, "click_timestamp": 2, "product_price": 999.0, "clicks_last_7d": 99}]).to_csv(future_a / "part-00000.csv", index=False)
+    pd.DataFrame([{"user_id": "u", "product_id": "a", "conversion_label": 0, "conversion_value_eur": np.nan, "click_timestamp": 3, "product_price": 999.0, "clicks_last_7d": 99}]).to_csv(future_b / "part-00000.csv", index=False)
     candidates = tmp_path / "temporal" / "ranking" / "coarse.csv"; candidates.parent.mkdir(parents=True)
     pd.DataFrame([{"user_id": "u", "candidate_ad_id": "a", "coarse_score": .5, "rank": 1}]).to_csv(candidates, index=False)
-    config = FineRankConfig(mode="temporal", input_path=candidates, output_path=tmp_path / "temporal" / "ranking" / "fine.csv", model_path=tmp_path / "temporal" / "models" / "model.pt", cache_dir=tmp_path / "temporal" / "ranking" / "fine_rank" / "train", feature_source_path=past, train_label_path=future_a, validation_label_path=None, metrics_path=tmp_path / "temporal" / "metrics.json", max_train_rows=10, chunk_size=10, embedding_dim=4, hidden_dims=(8,), num_cross_layers=1, batch_size=1, inference_batch_size=1, epochs=1, num_workers=0, prefetch_factor=1, persistent_workers=False, bucket_sizes=(17,) * len(SPARSE_FEATURES), validation_fraction=.1)
+    config = FineRankConfig(mode="temporal", input_path=candidates, output_path=tmp_path / "temporal" / "ranking" / "fine.csv", model_path=tmp_path / "temporal" / "models" / "model.pt", cache_dir=tmp_path / "temporal" / "ranking" / "fine_rank" / "train", feature_source_path=past, train_label_path=future_a, validation_label_path=future_b, metrics_path=tmp_path / "temporal" / "metrics.json", max_train_rows=10, chunk_size=10, embedding_dim=4, hidden_dims=(8,), num_cross_layers=1, batch_size=1, inference_batch_size=1, epochs=1, num_workers=0, prefetch_factor=1, persistent_workers=False, bucket_sizes=(17,) * len(SPARSE_FEATURES), validation_fraction=.1)
     build_dataset(config)
     row = next(iter(FineRankParquetDataset(config.cache_dir)))
     assert row["label"] == 1.0

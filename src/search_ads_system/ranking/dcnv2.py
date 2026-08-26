@@ -89,8 +89,25 @@ class DCNv2MultiTask(nn.Module):
 
     @torch.no_grad()
     def predict(self, dense: Tensor, sparse: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Return pCVR, non-negative value and their expected-value product."""
+        """Backward-compatible prediction using a bounded raw log-value head."""
+        probability, _, value, expected = self.predict_with_log(dense, sparse)
+        return probability, value, expected
+
+    @torch.no_grad()
+    def predict_with_log(self, dense: Tensor, sparse: Tensor, *, value_mean: float = 0.0, value_std: float = 1.0, prediction_log_min: float = 0.0, prediction_log_max: float = 20.0) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Decode a normalized value head with a finite, non-negative clamp.
+
+        ``prediction_log_max`` is intentionally applied before ``expm1``.  A
+        non-finite model output is a numerical failure, not a missing target,
+        and is raised rather than silently filtered from metrics.
+        """
         logits, log_value = self(dense, sparse)
+        if not torch.isfinite(logits).all() or not torch.isfinite(log_value).all():
+            raise FloatingPointError("Fine-rank model produced non-finite logits")
         probability = torch.sigmoid(logits)
-        value = torch.expm1(log_value).clamp_min(0.0)
-        return probability, value, probability * value
+        predicted_log_value = (log_value * float(value_std) + float(value_mean)).clamp(float(prediction_log_min), float(prediction_log_max))
+        value = torch.expm1(predicted_log_value)
+        expected = probability * value
+        if not torch.isfinite(value).all() or not torch.isfinite(expected).all():
+            raise FloatingPointError("Fine-rank value decoding produced non-finite predictions")
+        return probability, predicted_log_value, value, expected

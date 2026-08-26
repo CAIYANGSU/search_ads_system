@@ -60,6 +60,7 @@ class FineRankConfig:
     learning_rate: float = 0.001
     weight_decay: float = 0.00001
     value_loss_weight: float = 0.2
+    value_log_clip_max: float = 20.0
     num_workers: int = 12
     prefetch_factor: int = 4
     pin_memory: bool = True
@@ -120,7 +121,7 @@ def parse_fine_rank_config(raw_config: Mapping[str, Any], config_path: Path) -> 
         top_k=int(options.get("top_k", 20)), max_train_rows=int(options.get("max_train_rows", 3_000_000)), chunk_size=int(options.get("chunk_size", 200_000)),
         embedding_dim=int(options.get("embedding_dim", 32)), hidden_dims=tuple(int(value) for value in options.get("hidden_dims", (256, 128, 64))), num_cross_layers=int(options.get("num_cross_layers", 3)),
         batch_size=int(options.get("batch_size", 8192)), inference_batch_size=int(options.get("inference_batch_size", options.get("batch_size", 8192) * 4)), epochs=int(options.get("epochs", 5)),
-        learning_rate=float(options.get("learning_rate", 0.001)), weight_decay=float(options.get("weight_decay", 0.00001)), value_loss_weight=float(options.get("value_loss_weight", 0.2)),
+        learning_rate=float(options.get("learning_rate", 0.001)), weight_decay=float(options.get("weight_decay", 0.00001)), value_loss_weight=float(options.get("value_loss_weight", 0.2)), value_log_clip_max=float(options.get("value_log_clip_max", 20.0)),
         num_workers=int(options.get("num_workers", min(12, max(1, os.cpu_count() or 1)))), prefetch_factor=int(options.get("prefetch_factor", 4)), pin_memory=bool(options.get("pin_memory", True)), persistent_workers=bool(options.get("persistent_workers", True)),
         amp=bool(options.get("amp", True)), device=str(options.get("device", "auto")), train=bool(options.get("train", True)), early_stopping=bool(early.get("enabled", True)), patience=int(early.get("patience", 2)), validation_fraction=float(options.get("validation_fraction", 0.1)), random_seed=seed, oom_retries=int(options.get("oom_retries", 3)), bucket_sizes=bucket_sizes,
     )
@@ -129,14 +130,14 @@ def parse_fine_rank_config(raw_config: Mapping[str, Any], config_path: Path) -> 
 
 
 def dataset_spec(config: FineRankConfig) -> FineRankDatasetSpec:
-    return FineRankDatasetSpec(cache_dir=config.cache_dir, candidate_path=config.input_path, feature_source_path=config.feature_source_path, train_label_path=config.train_label_path, validation_label_path=config.validation_label_path, mode=config.mode, max_train_rows=config.max_train_rows, chunk_size=config.chunk_size, validation_fraction=config.validation_fraction, random_seed=config.random_seed, bucket_sizes=config.bucket_sizes)
+    return FineRankDatasetSpec(cache_dir=config.cache_dir, candidate_path=config.input_path, feature_source_path=config.feature_source_path, train_label_path=config.train_label_path, validation_label_path=config.validation_label_path, mode=config.mode, max_train_rows=config.max_train_rows, chunk_size=config.chunk_size, validation_fraction=config.validation_fraction, random_seed=config.random_seed, value_log_clip_max=config.value_log_clip_max, bucket_sizes=config.bucket_sizes)
 
 
-def multitask_loss(logits: Tensor, predicted_log_value: Tensor, labels: Tensor, values: Tensor, value_mask: Tensor, value_loss_weight: float) -> tuple[Tensor, Tensor, Tensor]:
-    """BCE pCVR loss plus masked Huber log-value loss, safe for empty masks."""
+def multitask_loss(logits: Tensor, predicted_log_value: Tensor, labels: Tensor, normalized_log_values: Tensor, value_mask: Tensor, value_loss_weight: float) -> tuple[Tensor, Tensor, Tensor]:
+    """BCE plus masked Huber loss in train-split-normalized log-value space."""
     cvr_loss = F.binary_cross_entropy_with_logits(logits, labels)
     valid = value_mask > 0.5
-    value_loss = F.smooth_l1_loss(predicted_log_value[valid], torch.log1p(values[valid].clamp_min(0.0))) if valid.any() else logits.new_zeros(())
+    value_loss = F.smooth_l1_loss(predicted_log_value[valid], normalized_log_values[valid]) if valid.any() else logits.new_zeros(())
     return cvr_loss + value_loss_weight * value_loss, cvr_loss, value_loss
 
 
@@ -168,7 +169,8 @@ def _train_once(config: FineRankConfig, metadata: Mapping[str, Any], device: tor
     model = build_model(config).to(device)
     optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=config.amp and device.type == "cuda")
-    train_loader = _loader(config.cache_dir, config, batch_size=batch_size, include_identifiers=False)
+    value_transform = _value_transform(metadata)
+    train_loader = _loader(config.cache_dir, config, batch_size=batch_size, value_transform=value_transform, include_identifiers=False)
     has_validation = bool(metadata.get("validation_row_count", 0)) and any(dataset_spec(config).validation_dir.glob("part-*.parquet"))
     history: list[dict[str, Any]] = []
     best_metric = float("-inf"); best_epoch = 0; stale_epochs = 0
@@ -187,7 +189,7 @@ def _train_once(config: FineRankConfig, metadata: Mapping[str, Any], device: tor
         if device.type == "cuda":
             record["peak_gpu_memory_bytes"] = int(torch.cuda.max_memory_allocated(device)); torch.cuda.reset_peak_memory_stats(device)
         if has_validation:
-            validation = evaluate_fine_ranker(model, config, split="validation", device=device)
+            validation = evaluate_fine_ranker(model, config, split="validation", device=device, metadata=metadata)
             record["validation"] = validation
             monitor = validation["pcvr"]["pr_auc"]
             monitor = float(monitor) if monitor is not None else -float(validation["pcvr"]["logloss"] or 0.0)
@@ -226,20 +228,25 @@ def load_fine_ranker(config: FineRankConfig, device: torch.device | None = None)
     return model, checkpoint
 
 
-def evaluate_fine_ranker(model: DCNv2MultiTask, config: FineRankConfig, *, split: str = "validation", device: torch.device | None = None) -> dict[str, Any]:
+def evaluate_fine_ranker(model: DCNv2MultiTask, config: FineRankConfig, *, split: str = "validation", device: torch.device | None = None, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
     target = device or resolve_device(config.device)
     directory = config.cache_dir if split == "train" else dataset_spec(config).validation_dir
     if not any(directory.glob("part-*.parquet")):
         return {"pcvr": {"roc_auc": None, "pr_auc": None, "logloss": None}, "value": {"mae": None, "rmse": None, "log_value_mae": None, "positive_value_rows": 0}, "ranking": {}, "expected_value_comparison": {}, "rows": 0}
-    loader = _loader(directory, config, batch_size=config.inference_batch_size, include_identifiers=True, force_workers=0)
+    transform = _value_transform(metadata or _load_cache_metadata(config))
+    loader = _loader(directory, config, batch_size=config.inference_batch_size, value_transform=transform, include_identifiers=True, force_workers=0)
     model.eval()
+    diagnostics = _PredictionDiagnostics()
     def batches() -> Iterator[dict[str, Any]]:
         with torch.no_grad():
             for batch in loader:
                 dense, sparse, labels, values, masks = _to_device(batch, target)
-                probability, predicted_value, _ = model.predict(dense, sparse)
-                yield {"label": labels.cpu().numpy(), "pcvr": probability.cpu().numpy(), "predicted_value": predicted_value.cpu().numpy(), "observed_value": values.cpu().numpy(), "value_mask": masks.cpu().numpy(), "user_id": batch["user_id"], "candidate_ad_id": batch["candidate_ad_id"], "coarse_score": batch["coarse_score"].numpy()}
-    return evaluate_fine_rank_predictions(batches())
+                probability, predicted_log_value, predicted_value, _ = model.predict_with_log(dense, sparse, **_prediction_kwargs(transform))
+                diagnostics.update(predicted_log_value.cpu().numpy(), predicted_value.cpu().numpy())
+                yield {"label": labels.cpu().numpy(), "pcvr": probability.cpu().numpy(), "predicted_value": predicted_value.cpu().numpy(), "observed_value": batch["observed_value"].numpy(), "value_mask": masks.cpu().numpy(), "user_id": batch["user_id"], "candidate_ad_id": batch["candidate_ad_id"], "coarse_score": batch["coarse_score"].numpy()}
+    result = evaluate_fine_rank_predictions(batches())
+    result["prediction_diagnostics"] = diagnostics.summary()
+    return result
 
 
 def infer_fine_rank(config: FineRankConfig) -> dict[str, Any]:
@@ -247,10 +254,11 @@ def infer_fine_rank(config: FineRankConfig) -> dict[str, Any]:
         raise FileNotFoundError(f"Fine-rank checkpoint not found: {config.model_path}")
     if not dataset_spec(config).index_path.is_file():
         build_dataset(config)
-    device = resolve_device(config.device); model, _ = load_fine_ranker(config, device); store = FineRankFeatureStore(dataset_spec(config).index_path)
+    device = resolve_device(config.device); model, checkpoint = load_fine_ranker(config, device); store = FineRankFeatureStore(dataset_spec(config).index_path)
+    transform = _value_transform(checkpoint.get("dataset_metadata", {}))
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = config.output_path.with_suffix(config.output_path.suffix + ".tmp")
-    started = time.perf_counter(); written = 0; processed = 0; batches = 0
+    started = time.perf_counter(); written = 0; processed = 0; batches = 0; diagnostics = _PredictionDiagnostics()
     try:
         with temporary.open("w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file); writer.writerow(("user_id", "candidate_ad_id", "pCVR", "predicted_conversion_value", "expected_value_score", "rank"))
@@ -258,16 +266,16 @@ def infer_fine_rank(config: FineRankConfig) -> dict[str, Any]:
             for user, group in _iter_candidate_groups(config.input_path, config.chunk_size):
                 pending.append((user, group)); pending_rows += len(group)
                 if pending_rows >= config.inference_batch_size:
-                    written += _score_pending(pending, model, store, config, device, writer); processed += pending_rows; batches += 1; pending = []; pending_rows = 0
+                    written += _score_pending(pending, model, store, config, device, writer, transform, diagnostics); processed += pending_rows; batches += 1; pending = []; pending_rows = 0
             if pending:
-                written += _score_pending(pending, model, store, config, device, writer); processed += pending_rows; batches += 1
+                written += _score_pending(pending, model, store, config, device, writer, transform, diagnostics); processed += pending_rows; batches += 1
         temporary.replace(config.output_path)
     finally:
         store.close()
         if temporary.exists():
             temporary.unlink()
     elapsed = time.perf_counter() - started
-    metrics = {"output_rows": written, "input_candidates": processed, "elapsed_seconds": elapsed, "candidates_per_second": processed / elapsed if elapsed else 0.0, "batches_per_second": batches / elapsed if elapsed else 0.0, "device": str(device), "batch_size": config.inference_batch_size}
+    metrics = {"output_rows": written, "input_candidates": processed, "elapsed_seconds": elapsed, "candidates_per_second": processed / elapsed if elapsed else 0.0, "batches_per_second": batches / elapsed if elapsed else 0.0, "device": str(device), "batch_size": config.inference_batch_size, "prediction_diagnostics": diagnostics.summary()}
     LOGGER.info("Fine-rank inference wrote %s rows (%.1f candidates/s) to %s", written, metrics["candidates_per_second"], config.output_path)
     return metrics
 
@@ -302,14 +310,15 @@ def resolve_device(option: str) -> torch.device:
     return requested
 
 
-def _score_pending(groups: list[tuple[str, pd.DataFrame]], model: DCNv2MultiTask, store: FineRankFeatureStore, config: FineRankConfig, device: torch.device, writer: csv.writer) -> int:
+def _score_pending(groups: list[tuple[str, pd.DataFrame]], model: DCNv2MultiTask, store: FineRankFeatureStore, config: FineRankConfig, device: torch.device, writer: csv.writer, value_transform: Mapping[str, float], diagnostics: "_PredictionDiagnostics") -> int:
     frame = pd.concat([group for _, group in groups], ignore_index=True)
     encoded = encode_feature_frame(store.enrich(frame), bucket_sizes=config.bucket_sizes, random_seed=config.random_seed)
     dense = torch.as_tensor(encoded[[f"dense__{name}" for name in DENSE_FEATURES]].to_numpy(dtype=np.float32), device=device)
     sparse = torch.as_tensor(encoded[[f"sparse__{name}" for name in SPARSE_FEATURES]].to_numpy(dtype=np.int64), device=device)
     model.eval()
     with torch.no_grad(), torch.amp.autocast(device_type=device.type, enabled=config.amp and device.type == "cuda"):
-        probability, value, expected = model.predict(dense, sparse)
+        probability, predicted_log_value, value, expected = model.predict_with_log(dense, sparse, **_prediction_kwargs(value_transform))
+    diagnostics.update(predicted_log_value.cpu().numpy(), value.cpu().numpy())
     encoded["pCVR"] = probability.cpu().numpy(); encoded["predicted_conversion_value"] = value.cpu().numpy(); encoded["expected_value_score"] = expected.cpu().numpy()
     offset = 0; written = 0
     for user, group in groups:
@@ -341,13 +350,71 @@ def _iter_candidate_groups(path: Path, chunk_size: int) -> Iterator[tuple[str, p
         yield current, pd.DataFrame(rows)
 
 
-def _loader(directory: Path, config: FineRankConfig, *, batch_size: int, include_identifiers: bool, force_workers: int | None = None) -> DataLoader[Any]:
+def _load_cache_metadata(config: FineRankConfig) -> dict[str, Any]:
+    path = dataset_spec(config).metadata_path
+    if not path.is_file():
+        raise FileNotFoundError(f"Fine-rank cache metadata is required for value decoding: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _value_transform(metadata: Mapping[str, Any]) -> dict[str, float]:
+    raw = metadata.get("value_transform")
+    if not isinstance(raw, Mapping):
+        raise ValueError("Fine-rank cache/checkpoint lacks normalized log-value transform metadata; rebuild the dataset")
+    required = ("mean", "std", "prediction_log_min", "prediction_log_max")
+    if any(name not in raw for name in required):
+        raise ValueError("Fine-rank value transform metadata is incomplete; rebuild the dataset")
+    transform = {name: float(raw[name]) for name in required}
+    if not np.isfinite(list(transform.values())).all() or transform["std"] <= 0 or transform["prediction_log_max"] < transform["prediction_log_min"]:
+        raise ValueError("Fine-rank value transform metadata is invalid")
+    return transform
+
+
+def _prediction_kwargs(transform: Mapping[str, float]) -> dict[str, float]:
+    return {"value_mean": float(transform["mean"]), "value_std": float(transform["std"]), "prediction_log_min": float(transform["prediction_log_min"]), "prediction_log_max": float(transform["prediction_log_max"])}
+
+
+class _PredictionDiagnostics:
+    """Bounded prediction diagnostics; validation is exact at normal cache size."""
+
+    def __init__(self, sample_limit: int = 1_000_000) -> None:
+        self.sample_limit = sample_limit
+        self.log_values: list[np.ndarray] = []
+        self.values: list[np.ndarray] = []
+        self.rows = 0
+        self.nonfinite = 0
+
+    def update(self, predicted_log_value: np.ndarray, predicted_value: np.ndarray) -> None:
+        logs = np.asarray(predicted_log_value, dtype=np.float64)
+        values = np.asarray(predicted_value, dtype=np.float64)
+        self.rows += len(logs)
+        self.nonfinite += int((~np.isfinite(logs)).sum() + (~np.isfinite(values)).sum())
+        if self.nonfinite:
+            raise FloatingPointError("Fine-rank prediction diagnostics found non-finite decoded values")
+        current = sum(len(value) for value in self.values)
+        remaining = self.sample_limit - current
+        if remaining > 0:
+            self.log_values.append(logs[:remaining].copy()); self.values.append(values[:remaining].copy())
+
+    def summary(self) -> dict[str, Any]:
+        logs = np.concatenate(self.log_values) if self.log_values else np.empty(0)
+        values = np.concatenate(self.values) if self.values else np.empty(0)
+        return {"rows": self.rows, "sampled_rows": len(values), "nonfinite_values": self.nonfinite, "predicted_log_value": _quantile_summary(logs), "predicted_value": _quantile_summary(values)}
+
+
+def _quantile_summary(values: np.ndarray) -> dict[str, float | None]:
+    if not len(values):
+        return {"min": None, "median": None, "p95": None, "p99": None, "max": None}
+    return {"min": float(values.min()), "median": float(np.median(values)), "p95": float(np.quantile(values, .95)), "p99": float(np.quantile(values, .99)), "max": float(values.max())}
+
+
+def _loader(directory: Path, config: FineRankConfig, *, batch_size: int, value_transform: Mapping[str, float], include_identifiers: bool, force_workers: int | None = None) -> DataLoader[Any]:
     workers = config.num_workers if force_workers is None else force_workers
     os.environ.setdefault("OMP_NUM_THREADS", "1"); os.environ.setdefault("MKL_NUM_THREADS", "1"); os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     kwargs: dict[str, Any] = {"batch_size": batch_size, "num_workers": workers, "pin_memory": config.pin_memory and resolve_device(config.device).type == "cuda"}
     if workers:
         kwargs.update(prefetch_factor=config.prefetch_factor, persistent_workers=config.persistent_workers)
-    return DataLoader(FineRankParquetDataset(directory, include_identifiers=include_identifiers), **kwargs)
+    return DataLoader(FineRankParquetDataset(directory, value_transform=value_transform, include_identifiers=include_identifiers), **kwargs)
 
 
 def _to_device(batch: Mapping[str, Any], device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -369,7 +436,7 @@ def _log_device_config(config: FineRankConfig, device: torch.device) -> None:
 
 def _validate_config(config: FineRankConfig) -> None:
     positive = (config.top_k, config.max_train_rows, config.chunk_size, config.embedding_dim, config.num_cross_layers, config.batch_size, config.inference_batch_size, config.epochs, config.num_workers, config.prefetch_factor)
-    if any(value <= 0 for value in positive) or not 0 <= config.value_loss_weight or not 0 < config.validation_fraction < 1 or config.patience <= 0:
+    if any(value <= 0 for value in positive) or not 0 <= config.value_loss_weight or not 0 < config.validation_fraction < 1 or config.patience <= 0 or not np.isfinite(config.value_log_clip_max) or config.value_log_clip_max <= 0:
         raise ValueError("Fine-rank numeric configuration contains an invalid value")
     if len(config.bucket_sizes) != len(SPARSE_FEATURES) or any(value <= 1 for value in config.bucket_sizes):
         raise ValueError("fine_rank hash bucket configuration is invalid")

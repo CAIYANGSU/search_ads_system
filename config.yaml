@@ -202,6 +202,9 @@ fine_rank:
   learning_rate: 0.001
   weight_decay: 0.00001
   value_loss_weight: 0.2
+  # Raw conversion values are trained as train-split-normalized log1p targets;
+  # this upper bound is applied before expm1 during decode to prevent overflow.
+  value_log_clip_max: 20.0
   device: auto
   num_workers: 12
   prefetch_factor: 4

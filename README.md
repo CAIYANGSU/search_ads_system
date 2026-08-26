@@ -117,9 +117,11 @@ PYTHONPATH=src python src/pipeline/run_coarse_rank.py --config config.yaml
 ## Fine Ranking
 
 精排使用 PyTorch DCNv2 的共享 Cross/Deep backbone，并输出 click-conditioned
-`pCVR` 与条件转化金额两个 head。训练样本只取 coarse candidate 与真实点击交互
-重合的 `(user_id, product_id)`；未点击候选不会被伪造为 CVR negative。金额 Huber
-loss 只在 `conversion_label=1` 且金额非空时启用，最终排序分数为离线 proxy：
+`pCVR` 与条件转化金额两个 head。训练样本直接来自真实 observed clicked
+interactions；coarse candidates 只用于无标签的流式推理，绝不会因未观测而被伪造为
+CVR negative。金额 Huber loss 使用 train split 统计量标准化后的 `log1p(value)`，
+仅在 `conversion_label=1` 且金额有限、非负时启用；解码前裁剪 predicted log value，
+最终排序分数为离线 proxy：
 `pCVR × predicted_conversion_value`，不等同于 CTR、eCPM 或线上收入。
 
 ```bash
