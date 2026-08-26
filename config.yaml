@@ -156,6 +156,8 @@ prerank:
   top_k: 100
 
 coarse_rank:
+  # Preserve and reuse the existing sklearn HistGBDT checkpoint by default.
+  model_type: hist_gbdt
   input_path: outputs/recall_candidates/fused_candidates.csv
   interaction_path: outputs/processed/criteo_unified
   output_path: outputs/ranking/coarse_rank_topk.csv
@@ -171,6 +173,13 @@ coarse_rank:
   conversion_sample_weight: 3.0
   # Bounded product-feature lookup cache for streaming inference.
   feature_cache_size: 100000
+  # Tune on the deployment host; each process limits native math threads to 1.
+  num_workers: 12
+  inference_batch_users: 1000
+  inference_batch_candidates: 100000
+  prefetch_batches: 2
+  # HistGBDT is CPU-only. A requested experimental GPU backend falls back with a log.
+  enable_gpu_if_available: false
 
 ranking:
   model: deepfm

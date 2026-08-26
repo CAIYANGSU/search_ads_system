@@ -18,11 +18,15 @@ import argparse
 import csv
 import hashlib
 import logging
+import os
 import pickle
 import sqlite3
+import tempfile
+import time
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +68,15 @@ LEAKAGE_COLUMNS = {
 }
 OUTPUT_COLUMNS = ("user_id", "candidate_ad_id", "coarse_score", "rank")
 _MISSING_CATEGORY = "__MISSING__"
+DEFAULT_FEATURES = (0.0, 0.0) + (_MISSING_CATEGORY,) * len(CATEGORICAL_AD_FEATURE_COLUMNS)
+_SQLITE_QUERY_BATCH_SIZE = 900
+
+# Process-worker state.  Each worker owns a read-only SQLite connection and
+# bounded feature cache; neither is copied from the parent process.
+_WORKER_MODEL: CoarseRankModel | None = None
+_WORKER_STORE: SQLiteFeatureStore | None = None
+_WORKER_TOP_K: int | None = None
+_WORKER_THREAD_CONTROLLER: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +96,14 @@ class CoarseRankConfig:
     negatives_per_positive: int = 5
     conversion_sample_weight: float = 3.0
     feature_cache_size: int = 100_000
+    model_type: str = "hist_gbdt"
+    # Programmatic callers stay single-process unless they opt in; YAML
+    # production defaults select up to 12 workers below.
+    num_workers: int = 1
+    inference_batch_users: int = 1_000
+    inference_batch_candidates: int = 100_000
+    prefetch_batches: int = 2
+    enable_gpu_if_available: bool = False
 
 
 @dataclass
@@ -92,6 +113,7 @@ class CoarseRankModel:
     estimator: HistGradientBoostingClassifier
     feature_columns: tuple[str, ...] = FEATURE_COLUMNS
     model_name: str = "sklearn.HistGradientBoostingClassifier"
+    model_type: str = "hist_gbdt"
 
 
 @dataclass(frozen=True)
@@ -127,6 +149,12 @@ def parse_coarse_rank_config(raw_config: Mapping[str, Any], config_path: Path) -
         negatives_per_positive=int(options.get("negative_sampling", {}).get("negatives_per_positive", 5)),
         conversion_sample_weight=float(options.get("conversion_sample_weight", 3.0)),
         feature_cache_size=int(options.get("feature_cache_size", 100_000)),
+        model_type=str(options.get("model_type", "hist_gbdt")).lower(),
+        num_workers=int(options.get("num_workers", max(1, min(12, os.cpu_count() or 1)))),
+        inference_batch_users=int(options.get("inference_batch_users", 1_000)),
+        inference_batch_candidates=int(options.get("inference_batch_candidates", 100_000)),
+        prefetch_batches=int(options.get("prefetch_batches", 2)),
+        enable_gpu_if_available=bool(options.get("enable_gpu_if_available", False)),
     )
     _validate_config(config)
     output_root = resolve_path(str(paths.get("outputs_dir", "outputs")), root)
@@ -384,11 +412,18 @@ def iter_candidate_groups(path: Path, chunk_size: int) -> Iterator[tuple[str, pd
 class SQLiteFeatureStore:
     """On-disk interaction/feature lookup with a bounded in-process LRU cache."""
 
-    def __init__(self, database_path: Path, cache_size: int = 100_000) -> None:
+    def __init__(self, database_path: Path, cache_size: int = 100_000, *, read_only: bool = False) -> None:
         self.database_path = database_path
-        self.connection = sqlite3.connect(database_path)
+        self.connection = (
+            sqlite3.connect(f"{database_path.as_uri()}?mode=ro", uri=True)
+            if read_only
+            else sqlite3.connect(database_path)
+        )
         self.cache_size = cache_size
         self._feature_cache: OrderedDict[str, tuple[Any, ...]] = OrderedDict()
+        self._unknown_cache: set[str] = set()
+        self.missing_feature_candidates = 0
+        self.total_feature_candidates = 0
 
     def close(self) -> None:
         self.connection.close()
@@ -397,7 +432,7 @@ class SQLiteFeatureStore:
         if not candidate_ids:
             return {}
         result: dict[str, tuple[int | None, int]] = {}
-        for batch in _batches(list(dict.fromkeys(candidate_ids)), 900):
+        for batch in _batches(list(dict.fromkeys(candidate_ids)), _SQLITE_QUERY_BATCH_SIZE):
             placeholders = ",".join("?" for _ in batch)
             query = f"SELECT candidate_ad_id, click_timestamp, conversion_label FROM interactions WHERE user_id = ? AND candidate_ad_id IN ({placeholders})"
             for candidate_id, timestamp, conversion in self.connection.execute(query, [user_id, *batch]):
@@ -405,27 +440,63 @@ class SQLiteFeatureStore:
         return result
 
     def enrich(self, candidates: pd.DataFrame) -> pd.DataFrame:
-        """Attach product features using bounded cache plus batched SQLite lookups."""
+        """Attach product features with a per-batch fallback map.
+
+        The local map is deliberately independent of the LRU: an eviction while
+        processing a large batch must never turn a valid unknown candidate into
+        a KeyError.  Unknown products receive the same deterministic defaults
+        as ordinary missing input values and remain eligible for Top-K.
+        """
 
         enriched = candidates.copy()
         candidate_ids = [str(value) for value in enriched["candidate_ad_id"]]
-        missing = [candidate_id for candidate_id in dict.fromkeys(candidate_ids) if candidate_id not in self._feature_cache]
-        for batch in _batches(missing, 900):
+        unique_ids = list(dict.fromkeys(candidate_ids))
+        batch_feature_map = {
+            candidate_id: self._feature_cache[candidate_id]
+            for candidate_id in unique_ids
+            if candidate_id in self._feature_cache
+        }
+        unknown_ids: set[str] = {candidate_id for candidate_id in batch_feature_map if candidate_id in self._unknown_cache}
+        missing = [candidate_id for candidate_id in unique_ids if candidate_id not in batch_feature_map]
+        for batch in _batches(missing, _SQLITE_QUERY_BATCH_SIZE):
             placeholders = ",".join("?" for _ in batch)
             query = "SELECT candidate_ad_id, product_price, clicks_last_7d, " + ", ".join(CATEGORICAL_AD_FEATURE_COLUMNS) + f" FROM ad_features WHERE candidate_ad_id IN ({placeholders})"
             found = {str(row[0]): tuple(row[1:]) for row in self.connection.execute(query, batch)}
             for candidate_id in batch:
-                self._cache_put(candidate_id, found.get(candidate_id, _empty_ad_features()))
-        values = [self._feature_cache[candidate_id] for candidate_id in candidate_ids]
+                values = found.get(candidate_id, DEFAULT_FEATURES)
+                if candidate_id not in found:
+                    unknown_ids.add(candidate_id)
+                batch_feature_map[candidate_id] = values
+                self._cache_put(candidate_id, values, is_unknown=candidate_id not in found)
+        self.total_feature_candidates += len(candidate_ids)
+        # Count candidate rows (rather than unique IDs) to make the reported
+        # rate representative of inference work.
+        self.missing_feature_candidates += sum(1 for candidate_id in candidate_ids if candidate_id in unknown_ids)
+        if unknown_ids:
+            LOGGER.debug("Feature index misses in batch: %s", len(unknown_ids))
+        values = [batch_feature_map[candidate_id] for candidate_id in candidate_ids]
         columns = list(NUMERIC_AD_FEATURE_COLUMNS + CATEGORICAL_AD_FEATURE_COLUMNS)
         feature_frame = pd.DataFrame(values, columns=columns, index=enriched.index)
         return pd.concat((enriched, feature_frame), axis=1)
 
-    def _cache_put(self, candidate_id: str, values: tuple[Any, ...]) -> None:
+    def consume_feature_stats(self) -> tuple[int, int]:
+        """Return and reset per-process feature lookup counters."""
+
+        result = self.missing_feature_candidates, self.total_feature_candidates
+        self.missing_feature_candidates = 0
+        self.total_feature_candidates = 0
+        return result
+
+    def _cache_put(self, candidate_id: str, values: tuple[Any, ...], *, is_unknown: bool = False) -> None:
         self._feature_cache[candidate_id] = values
+        if is_unknown:
+            self._unknown_cache.add(candidate_id)
+        else:
+            self._unknown_cache.discard(candidate_id)
         self._feature_cache.move_to_end(candidate_id)
         if len(self._feature_cache) > self.cache_size:
-            self._feature_cache.popitem(last=False)
+            evicted_id, _ = self._feature_cache.popitem(last=False)
+            self._unknown_cache.discard(evicted_id)
 
 
 def build_interaction_feature_index(config: CoarseRankConfig, database_path: Path) -> SQLiteFeatureStore:
@@ -505,34 +576,340 @@ def score_candidate_group(candidates: pd.DataFrame, model: CoarseRankModel, feat
     return scored.sort_values(["coarse_score", "rrf_score", "candidate_ad_id"], ascending=[False, False, True], kind="mergesort")
 
 
-def stream_coarse_rank_output(config: CoarseRankConfig, model: CoarseRankModel, feature_store: SQLiteFeatureStore) -> int:
-    """Score all candidates in streaming user groups and atomically emit Top-K."""
+def iter_candidate_batches(
+    path: Path, chunk_size: int, *, max_users: int, batch_users: int, batch_candidates: int
+) -> Iterator[list[tuple[str, pd.DataFrame]]]:
+    """Yield bounded batches made exclusively of complete user candidate sets."""
+
+    batch: list[tuple[str, pd.DataFrame]] = []
+    candidates_in_batch = 0
+    users_seen = 0
+    for user_id, candidates in iter_candidate_groups(path, chunk_size):
+        if users_seen >= max_users:
+            break
+        # Never split a user at a batch boundary.  An unusually large single
+        # user is still emitted as one bounded-by-source group.
+        if batch and (len(batch) >= batch_users or candidates_in_batch + len(candidates) > batch_candidates):
+            yield batch
+            batch = []
+            candidates_in_batch = 0
+        batch.append((user_id, candidates))
+        candidates_in_batch += len(candidates)
+        users_seen += 1
+    if batch:
+        yield batch
+
+
+def score_candidate_batch(
+    user_groups: Sequence[tuple[str, pd.DataFrame]], model: CoarseRankModel, feature_store: SQLiteFeatureStore, top_k: int
+) -> list[tuple[str, str, float, int]]:
+    """Run one vectorised feature lookup/predict call for many complete users."""
+
+    if not user_groups:
+        return []
+    boundaries: list[tuple[str, int, int]] = []
+    frames: list[pd.DataFrame] = []
+    offset = 0
+    for user_id, candidates in user_groups:
+        frames.append(candidates)
+        end = offset + len(candidates)
+        boundaries.append((user_id, offset, end))
+        offset = end
+    # This concat is deliberately capped by inference_batch_candidates; it is
+    # not a global candidate merge.
+    batch = pd.concat(frames, ignore_index=True, copy=False)
+    enriched = feature_store.enrich(batch)
+    scores = model.estimator.predict_proba(preprocess_features(enriched))[:, 1]
+    rrf_scores = pd.to_numeric(enriched["rrf_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    candidate_ids = enriched["candidate_ad_id"].astype(str).to_numpy()
+    output_rows: list[tuple[str, str, float, int]] = []
+    for user_id, start, end in boundaries:
+        # Each group has approximately 100 rows.  Sorting this small local
+        # slice gives the exact deterministic three-key Top-K ordering without
+        # a costly global sort.
+        order = np.lexsort((candidate_ids[start:end], -rrf_scores[start:end], -scores[start:end]))[:top_k]
+        for rank, local_index in enumerate(order, start=1):
+            index = start + int(local_index)
+            output_rows.append((user_id, str(candidate_ids[index]), float(scores[index]), rank))
+    return output_rows
+
+
+def _initialise_inference_worker(
+    model_blob: bytes, database_path: str, cache_size: int, top_k: int, thread_limit: int
+) -> None:
+    """Initialise a worker-local model, SQLite reader and one-thread backend."""
+
+    global _WORKER_MODEL, _WORKER_STORE, _WORKER_TOP_K, _WORKER_THREAD_CONTROLLER
+    os.environ["OMP_NUM_THREADS"] = str(thread_limit)
+    os.environ["MKL_NUM_THREADS"] = str(thread_limit)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(thread_limit)
+    try:
+        from threadpoolctl import threadpool_limits
+
+        _WORKER_THREAD_CONTROLLER = threadpool_limits(limits=thread_limit)
+    except ImportError:
+        # scikit-learn installs threadpoolctl, but keep inference usable in a
+        # minimal environment and retain the explicit environment settings.
+        pass
+    _WORKER_MODEL = pickle.loads(model_blob)
+    _WORKER_STORE = SQLiteFeatureStore(Path(database_path), cache_size, read_only=True)
+    _WORKER_TOP_K = top_k
+
+
+def _score_batch_worker(
+    task: tuple[int, list[tuple[str, pd.DataFrame]]]
+) -> tuple[int, list[tuple[str, str, float, int]], int, int]:
+    """Process one bounded batch and return stats to the single writer."""
+
+    if _WORKER_MODEL is None or _WORKER_STORE is None or _WORKER_TOP_K is None:
+        raise RuntimeError("Coarse-rank worker was not initialised")
+    sequence, user_groups = task
+    rows = score_candidate_batch(user_groups, _WORKER_MODEL, _WORKER_STORE, _WORKER_TOP_K)
+    missing, total = _WORKER_STORE.consume_feature_stats()
+    return sequence, rows, missing, total
+
+
+def _log_progress(
+    *, processed_candidates: int, processed_users: int, elapsed_seconds: float, missing_features: int, total_features: int
+) -> None:
+    elapsed = max(elapsed_seconds, 1e-9)
+    LOGGER.info(
+        "processed_candidates=%s processed_users=%s elapsed_seconds=%.2f candidates_per_second=%.1f users_per_second=%.1f missing_feature_candidates=%s total_feature_candidates=%s missing_feature_rate=%.6f",
+        processed_candidates,
+        processed_users,
+        elapsed,
+        processed_candidates / elapsed,
+        processed_users / elapsed,
+        missing_features,
+        total_features,
+        missing_features / total_features if total_features else 0.0,
+    )
+
+
+def stream_coarse_rank_output(
+    config: CoarseRankConfig,
+    model: CoarseRankModel,
+    feature_store: SQLiteFeatureStore,
+    *,
+    max_users: int | None = None,
+    stats: dict[str, float] | None = None,
+) -> int:
+    """Micro-batch complete users, predict once per batch, and atomically write Top-K.
+
+    ``num_workers > 1`` uses a bounded process pool with read-only SQLite
+    connections.  Only the parent writes CSV and commits rows in input-batch
+    sequence, so the result is deterministic and workers cannot corrupt output.
+    """
 
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = config.output_path.with_suffix(config.output_path.suffix + ".tmp")
     written = 0
     processed_candidates = 0
     processed_users = 0
+    missing_features = 0
+    total_features = 0
+    start_time = time.monotonic()
+    user_limit = config.max_users if max_users is None else max_users
+    worker_count = config.num_workers
+    LOGGER.info(
+        "Coarse inference available_cpu_count=%s configured_num_workers=%s inference_batch_users=%s inference_batch_candidates=%s prefetch_batches=%s native_threads_per_worker=%s",
+        os.cpu_count(), worker_count, config.inference_batch_users, config.inference_batch_candidates, config.prefetch_batches,
+        1 if worker_count > 1 else "backend-default",
+    )
+    # Training/evaluation may have used this parent store before inference;
+    # report only feature misses from the current output pass.
+    feature_store.consume_feature_stats()
+
+    # Treat the configured batch sizes as the total in-flight budget.  In a
+    # process pool each task therefore receives a fraction of that budget,
+    # preventing 12 workers from accidentally buffering 12 x 100k rows.
+    task_batch_users = config.inference_batch_users
+    task_batch_candidates = config.inference_batch_candidates
+    if worker_count > 1:
+        task_batch_users = max(1, (task_batch_users + worker_count - 1) // worker_count)
+        task_batch_candidates = max(1, (task_batch_candidates + worker_count - 1) // worker_count)
+
+    def write_rows(writer: csv.writer, rows: Sequence[tuple[str, str, float, int]]) -> None:
+        nonlocal written, processed_candidates, processed_users, missing_features, total_features
+        writer.writerows(rows)
+        written += len(rows)
+
+    executor: ProcessPoolExecutor | None = None
+    if worker_count > 1:
+        try:
+            executor = ProcessPoolExecutor(
+                max_workers=worker_count,
+                initializer=_initialise_inference_worker,
+                initargs=(
+                    pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL),
+                    str(feature_store.database_path),
+                    config.feature_cache_size,
+                    config.top_k,
+                    1,
+                ),
+            )
+        except (OSError, PermissionError, NotImplementedError) as error:
+            # Some constrained runtimes prohibit POSIX semaphores.  This is a
+            # process-pool availability fallback only; task/worker exceptions
+            # from an active pool still propagate to the caller.
+            LOGGER.warning("Multi-process inference unavailable (%s); falling back to one worker", error)
+            worker_count = 1
+            task_batch_users = config.inference_batch_users
+            task_batch_candidates = config.inference_batch_candidates
+    batches = iter_candidate_batches(
+        config.input_path,
+        config.chunk_size,
+        max_users=user_limit,
+        batch_users=task_batch_users,
+        batch_candidates=task_batch_candidates,
+    )
+    LOGGER.info("Coarse inference task_batch_users=%s task_batch_candidates=%s active_workers=%s", task_batch_users, task_batch_candidates, worker_count)
     with temporary.open("w", newline="", encoding="utf-8") as output_file:
         writer = csv.writer(output_file)
         writer.writerow(OUTPUT_COLUMNS)
-        for user_id, candidates in iter_candidate_groups(config.input_path, config.chunk_size):
-            ranked = score_candidate_group(candidates, model, feature_store).iloc[: config.top_k]
-            for rank, row in enumerate(ranked.itertuples(index=False), start=1):
-                writer.writerow((user_id, row.candidate_ad_id, float(row.coarse_score), rank))
-                written += 1
-            processed_candidates += len(candidates)
-            processed_users += 1
-            if processed_users % 10_000 == 0:
-                LOGGER.info("processed_candidates=%s processed_users=%s memory-safe coarse inference", processed_candidates, processed_users)
+        if worker_count == 1:
+            for user_groups in batches:
+                rows = score_candidate_batch(user_groups, model, feature_store, config.top_k)
+                write_rows(writer, rows)
+                processed_users += len(user_groups)
+                processed_candidates += sum(len(candidates) for _, candidates in user_groups)
+                missing, total = feature_store.consume_feature_stats()
+                missing_features += missing
+                total_features += total
+                _log_progress(
+                    processed_candidates=processed_candidates,
+                    processed_users=processed_users,
+                    elapsed_seconds=time.monotonic() - start_time,
+                    missing_features=missing_features,
+                    total_features=total_features,
+                )
+        else:
+            # One active task per worker plus a small producer look-ahead is a
+            # bounded queue with backpressure, not an unbounded future list.
+            max_pending = worker_count + config.prefetch_batches
+            pending: dict[Future[tuple[int, list[tuple[str, str, float, int]], int, int]], tuple[int, int]] = {}
+            completed: dict[int, tuple[list[tuple[str, str, float, int]], int, int, int, int]] = {}
+            next_sequence = 0
+            next_to_write = 0
+            batches_exhausted = False
+            assert executor is not None
+            with executor:
+                while pending or not batches_exhausted:
+                    while not batches_exhausted and len(pending) < max_pending:
+                        try:
+                            user_groups = next(batches)
+                        except StopIteration:
+                            batches_exhausted = True
+                            break
+                        candidate_count = sum(len(candidates) for _, candidates in user_groups)
+                        future = executor.submit(_score_batch_worker, (next_sequence, user_groups))
+                        pending[future] = (len(user_groups), candidate_count)
+                        next_sequence += 1
+                    if not pending:
+                        continue
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        user_count, candidate_count = pending.pop(future)
+                        sequence, rows, missing, total = future.result()  # propagates worker errors
+                        completed[sequence] = (rows, missing, total, user_count, candidate_count)
+                    while next_to_write in completed:
+                        rows, missing, total, user_count, candidate_count = completed.pop(next_to_write)
+                        write_rows(writer, rows)
+                        processed_users += user_count
+                        processed_candidates += candidate_count
+                        missing_features += missing
+                        total_features += total
+                        _log_progress(
+                            processed_candidates=processed_candidates,
+                            processed_users=processed_users,
+                            elapsed_seconds=time.monotonic() - start_time,
+                            missing_features=missing_features,
+                            total_features=total_features,
+                        )
+                        next_to_write += 1
     temporary.replace(config.output_path)
+    _log_progress(
+        processed_candidates=processed_candidates,
+        processed_users=processed_users,
+        elapsed_seconds=time.monotonic() - start_time,
+        missing_features=missing_features,
+        total_features=total_features,
+    )
+    if stats is not None:
+        elapsed = max(time.monotonic() - start_time, 1e-9)
+        stats.update(
+            {
+                "processed_candidates": float(processed_candidates),
+                "processed_users": float(processed_users),
+                "elapsed_seconds": elapsed,
+                "candidates_per_second": processed_candidates / elapsed,
+                "users_per_second": processed_users / elapsed,
+                "missing_feature_candidates": float(missing_features),
+                "total_feature_candidates": float(total_features),
+            }
+        )
     LOGGER.info("Wrote %s coarse-rank rows to %s", written, config.output_path)
     return written
+
+
+def resolve_inference_backend(config: CoarseRankConfig) -> str:
+    """Select the supported backend and make every fallback explicit.
+
+    The persisted baseline is sklearn HistGBDT.  XGBoost/LightGBM checkpoints
+    have a different serialization contract and are intentionally not silently
+    substituted for it.  A future accelerated experiment must use its own
+    ``model_path`` and explicitly implement/train that backend.
+    """
+
+    if config.model_type == "hist_gbdt":
+        if config.enable_gpu_if_available:
+            LOGGER.info("HistGBDT backend is CPU-only; retaining the existing CPU checkpoint semantics")
+        LOGGER.info("Coarse rank backend: hist_gbdt; device: cpu")
+        return "hist_gbdt"
+    if config.model_type in {"xgboost", "xgboost_gpu", "lightgbm", "lightgbm_gpu"}:
+        LOGGER.warning(
+            "Requested backend %s is not available in this HistGBDT checkpoint pipeline; falling back to HistGBDT CPU. "
+            "Use a distinct model_path when adding a trained accelerated backend.",
+            config.model_type,
+        )
+        return "hist_gbdt"
+    raise ValueError("coarse_rank.model_type must be hist_gbdt, xgboost[_gpu], or lightgbm[_gpu]")
+
+
+def benchmark_coarse_rank(
+    config: CoarseRankConfig,
+    model: CoarseRankModel,
+    feature_store: SQLiteFeatureStore,
+    *,
+    worker_counts: Sequence[int] = (1, 4, 8, 12),
+    max_users: int = 10_000,
+) -> dict[int, dict[str, float]]:
+    """Benchmark bounded inference into disposable files, never the formal output."""
+
+    results: dict[int, dict[str, float]] = {}
+    with tempfile.TemporaryDirectory(prefix="coarse-rank-benchmark-") as directory:
+        for workers in worker_counts:
+            if workers <= 0:
+                raise ValueError("benchmark worker counts must be positive")
+            output_path = Path(directory) / f"workers-{workers}.csv"
+            benchmark_config = replace(config, output_path=output_path, num_workers=workers)
+            run_stats: dict[str, float] = {}
+            stream_coarse_rank_output(benchmark_config, model, feature_store, max_users=max_users, stats=run_stats)
+            results[workers] = run_stats
+            LOGGER.info(
+                "benchmark workers=%s candidates_per_second=%.1f users_per_second=%.1f elapsed_seconds=%.2f",
+                workers,
+                run_stats["candidates_per_second"],
+                run_stats["users_per_second"],
+                run_stats["elapsed_seconds"],
+            )
+    return results
 
 
 def run_coarse_rank(config: CoarseRankConfig) -> dict[str, float]:
     """Train/load a checkpoint, evaluate it, then stream the final Top-K output."""
 
+    resolve_inference_backend(config)
     database_path = config.model_path.with_suffix(config.model_path.suffix + ".features.sqlite")
     feature_store = build_interaction_feature_index(config, database_path)
     try:
@@ -568,6 +945,10 @@ def _validate_config(config: CoarseRankConfig) -> None:
         raise ValueError("max_train_rows, max_users, top_k, and chunk_size must be positive")
     if config.negatives_per_positive < 0 or config.conversion_sample_weight < 1.0 or config.feature_cache_size <= 0:
         raise ValueError("negative sampling, conversion weight, and feature cache settings are invalid")
+    if config.num_workers <= 0 or config.inference_batch_users <= 0 or config.inference_batch_candidates <= 0 or config.prefetch_batches <= 0:
+        raise ValueError("inference worker and batch settings must be positive")
+    if config.model_type not in {"hist_gbdt", "xgboost", "xgboost_gpu", "lightgbm", "lightgbm_gpu"}:
+        raise ValueError("coarse_rank.model_type must be hist_gbdt, xgboost[_gpu], or lightgbm[_gpu]")
 
 
 def _empty_examples() -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:

@@ -15,13 +15,18 @@ from search_ads_system.ranking.coarse_rank import (
     assert_no_leakage_features,
     build_interaction_feature_index,
     build_labeled_user_examples,
+    benchmark_coarse_rank,
     collect_training_data,
     deterministic_negative_sample,
     iter_candidate_groups,
+    iter_candidate_batches,
     load_model,
     preprocess_features,
     run_coarse_rank,
+    resolve_inference_backend,
     save_model,
+    score_candidate_batch,
+    score_candidate_group,
     stream_coarse_rank_output,
     train_coarse_ranker,
 )
@@ -132,6 +137,9 @@ def test_output_top_k_ranks_from_one_and_respects_limit(tmp_path: Path) -> None:
         output = pd.read_csv(config.output_path)
         assert output.groupby("user_id").size().eq(2).all()
         assert output.groupby("user_id")["rank"].apply(lambda ranks: ranks.tolist() == [1, 2]).all()
+        # b*/c* are intentionally absent from the feature index but remain in
+        # candidate output through deterministic default features.
+        assert output["candidate_ad_id"].str.startswith(("b", "c")).any()
     finally:
         store.close()
 
@@ -149,3 +157,81 @@ def test_train_false_loads_existing_model_and_writes_output(tmp_path: Path) -> N
     result = run_coarse_rank(_config(tmp_path, train=False))
     assert result == {}
     assert (tmp_path / "coarse.csv").is_file()
+
+
+def test_feature_store_uses_defaults_for_unknowns_after_cache_eviction(tmp_path: Path) -> None:
+    _write_data(tmp_path)
+    config = _config(tmp_path)
+    store = build_interaction_feature_index(config, tmp_path / "index.sqlite")
+    store.cache_size = 1
+    try:
+        first = store.enrich(
+            pd.DataFrame(
+                [
+                    {"candidate_ad_id": "a1", "rrf_score": 0.9, "source_count": 2},
+                    {"candidate_ad_id": "unknown", "rrf_score": 0.1, "source_count": 1},
+                ]
+            )
+        )
+        assert first.loc[0, "product_price"] == 1.0
+        assert first.loc[1, "product_price"] == 0.0
+        assert first.loc[1, "device_type"] == "__MISSING__"
+        # a1 is evicted by the tiny cache; a mixed follow-up batch must still
+        # retrieve it and must never KeyError for the unknown candidate.
+        second = store.enrich(
+            pd.DataFrame(
+                [
+                    {"candidate_ad_id": "a1", "rrf_score": 0.9, "source_count": 2},
+                    {"candidate_ad_id": "also-unknown", "rrf_score": 0.1, "source_count": 1},
+                ]
+            )
+        )
+        assert second["candidate_ad_id"].tolist() == ["a1", "also-unknown"]
+        assert second.loc[0, "product_price"] == 1.0
+        missing, total = store.consume_feature_stats()
+        assert (missing, total) == (2, 4)
+    finally:
+        store.close()
+
+
+def test_batch_inference_matches_per_user_and_parallel_output(tmp_path: Path) -> None:
+    _write_data(tmp_path)
+    config = _config(tmp_path, top_k=2)
+    store = build_interaction_feature_index(config, tmp_path / "index.sqlite")
+    try:
+        model, _, _ = train_coarse_ranker(collect_training_data(config, store), config)
+        groups = list(iter_candidate_groups(config.input_path, config.chunk_size))
+        batched = score_candidate_batch(groups, model, store, config.top_k)
+        expected = []
+        for user_id, candidates in groups:
+            ranked = score_candidate_group(candidates, model, store).iloc[: config.top_k]
+            expected.extend((user_id, row.candidate_ad_id, float(row.coarse_score), rank) for rank, row in enumerate(ranked.itertuples(index=False), start=1))
+        assert [(user, candidate, rank) for user, candidate, _, rank in batched] == [
+            (user, candidate, rank) for user, candidate, _, rank in expected
+        ]
+        single_path = config.output_path
+        stream_coarse_rank_output(config, model, store)
+        single = pd.read_csv(single_path)
+        parallel_config = CoarseRankConfig(**{**config.__dict__, "output_path": tmp_path / "parallel.csv", "num_workers": 2})
+        stream_coarse_rank_output(parallel_config, model, store)
+        parallel = pd.read_csv(parallel_config.output_path)
+        pd.testing.assert_frame_equal(single, parallel)
+    finally:
+        store.close()
+
+
+def test_bounded_user_batches_backend_fallback_and_benchmark(tmp_path: Path) -> None:
+    _write_data(tmp_path)
+    config = _config(tmp_path)
+    batches = list(iter_candidate_batches(config.input_path, config.chunk_size, max_users=4, batch_users=2, batch_candidates=6))
+    assert [len(batch) for batch in batches] == [2, 2]
+    assert all(sum(len(candidates) for _, candidates in batch) <= 6 for batch in batches)
+    assert resolve_inference_backend(CoarseRankConfig(**{**config.__dict__, "model_type": "xgboost_gpu"})) == "hist_gbdt"
+    store = build_interaction_feature_index(config, tmp_path / "index.sqlite")
+    try:
+        model, _, _ = train_coarse_ranker(collect_training_data(config, store), config)
+        result = benchmark_coarse_rank(config, model, store, worker_counts=(1,), max_users=2)
+        assert result[1]["processed_candidates"] == 6
+        assert result[1]["candidates_per_second"] > 0
+    finally:
+        store.close()
