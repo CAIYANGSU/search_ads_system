@@ -1,5 +1,6 @@
 from pathlib import Path
 import pandas as pd
+import pytest
 
 import numpy as np
 
@@ -56,3 +57,64 @@ def test_temporal_future_a_conversion_weights_are_not_features(tmp_path: Path) -
     assert weights.tolist()==[1.0,3.0,1.0]
     assert 'conversion_label' not in FEATURE_COLUMNS
     assert_no_leakage_features(FEATURE_COLUMNS)
+
+
+def _write_future_positives(path: Path, rows: list[tuple[str, str]]) -> None:
+    path.mkdir()
+    pd.DataFrame(rows,columns=['user_id','product_id']).to_csv(path/'part-00000.csv',index=False)
+
+
+def test_recall_evaluation_uses_explicit_rank(tmp_path: Path, caplog) -> None:
+    future=tmp_path/'future'
+    _write_future_positives(future,[('u1','a'),('u1','c')])
+    candidates=tmp_path/'itemcf_topk.csv'
+    pd.DataFrame([('u1','a',1),('u1','x',2),('u1','c',11)],columns=['user_id','candidate_ad_id','rank']).to_csv(candidates,index=False)
+
+    with caplog.at_level('INFO'):
+        metrics=evaluate_recall_file(candidates,future,chunk_size=2)
+
+    assert metrics['metrics']['recall@10']==.5
+    assert metrics['metrics']['recall@20']==1.0
+    assert 'Evaluating itemcf with explicit rank' in caplog.text
+
+
+def test_rrf_evaluation_derives_continuous_per_user_rank_across_chunks(tmp_path: Path, caplog) -> None:
+    future=tmp_path/'future'
+    _write_future_positives(future,[('u1','p10'),('u1','p11'),('u2','first')])
+    candidates=tmp_path/'fused_candidates.csv'
+    rows=[('u1',f'p{index}',1.0/index,1) for index in range(1,13)]
+    rows += [('u2','first',.9,1),('u2','other',.8,1)]
+    pd.DataFrame(rows,columns=['user_id','candidate_ad_id','rrf_score','source_count']).to_csv(candidates,index=False)
+
+    with caplog.at_level('INFO'):
+        metrics=evaluate_recall_file(candidates,future,chunk_size=2)
+
+    assert metrics['metrics']['recall@10']==.75
+    assert metrics['metrics']['recall@20']==1.0
+    assert metrics['metrics']['recall@50']==1.0
+    assert metrics['metrics']['recall@100']==1.0
+    assert 'Evaluating rrf with derived per-user rank' in caplog.text
+
+
+def test_popularity_evaluation_remains_global_recall(tmp_path: Path, caplog) -> None:
+    future=tmp_path/'future'
+    _write_future_positives(future,[('u1','popular'),('u2','not-recalled')])
+    candidates=tmp_path/'popularity_topk.csv'
+    pd.DataFrame([('popular',.9,1),('other',.8,2)],columns=['candidate_ad_id','popularity_score','rank']).to_csv(candidates,index=False)
+
+    with caplog.at_level('INFO'):
+        metrics=evaluate_recall_file(candidates,future,chunk_size=1)
+
+    assert metrics['metrics']['recall@10']==.5
+    assert metrics['metrics']['recall@20']==.5
+    assert 'Evaluating popularity as global recall' in caplog.text
+
+
+def test_recall_evaluation_validates_required_schema(tmp_path: Path) -> None:
+    future=tmp_path/'future'
+    _write_future_positives(future,[('u1','a')])
+    candidates=tmp_path/'invalid.csv'
+    pd.DataFrame([('u1',1)],columns=['user_id','rank']).to_csv(candidates,index=False)
+
+    with pytest.raises(ValueError,match='candidate_ad_id'):
+        evaluate_recall_file(candidates,future)

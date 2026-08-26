@@ -104,33 +104,35 @@ def build_temporal_split(config: TemporalConfig) -> dict[str, Any]:
 def evaluate_recall_file(candidate_path: Path, future_path: Path, *, cutoffs: Iterable[int] = (10,20,50,100), chunk_size: int = 200_000) -> dict[str, Any]:
     """Evaluate multi-positive Recall@K from a future-only label directory."""
     positives = _future_positives(future_path, chunk_size)
-    header = pd.read_csv(candidate_path, nrows=0).columns
+    header = set(pd.read_csv(candidate_path, nrows=0).columns)
+    if "candidate_ad_id" not in header:
+        raise ValueError(f"Recall candidates at {candidate_path} must include candidate_ad_id")
+    source = _recall_source_name(candidate_path)
     if "user_id" not in header:
-        global_candidates = [(str(ad), int(rank)) for ad, rank in pd.read_csv(candidate_path, usecols=["candidate_ad_id", "rank"]).itertuples(index=False, name=None)]
+        if "rank" not in header:
+            raise ValueError(f"Global recall candidates at {candidate_path} must include rank")
+        LOGGER.info("Evaluating %s as global recall", source)
+        global_candidates = [(str(ad), _recall_rank(rank)) for ad, rank in pd.read_csv(candidate_path, usecols=["candidate_ad_id", "rank"]).itertuples(index=False, name=None)]
         return _evaluate_candidate_mapping({user: global_candidates for user in positives}, positives, cutoffs)
-    hits = {int(k): 0 for k in cutoffs}; recalls = {int(k): 0.0 for k in cutoffs}; users_hit = {int(k): 0 for k in cutoffs}
-    seen: set[str] = set(); unique_ads: set[str] = set(); rows = 0
-    for chunk in pd.read_csv(candidate_path, chunksize=chunk_size, low_memory=False):
-        for user, ad, rank in chunk[["user_id","candidate_ad_id","rank"]].itertuples(index=False, name=None):
-            user, ad = _id(user), _id(ad)
-            if user not in positives or user is None or ad is None: continue
-            rows += 1; unique_ads.add(ad)
-            for cutoff in hits:
-                if int(rank) <= cutoff and ad in positives[user]:
-                    hits[cutoff] += 1
-        # candidates are grouped by user in all recall writers; metrics below
-        # use set intersection in a second bounded pass for correctness.
-    for user, candidates in _candidate_groups(candidate_path, chunk_size):
+    has_explicit_rank = "rank" in header
+    LOGGER.info(
+        "Evaluating %s with %s", source,
+        "explicit rank" if has_explicit_rank else "derived per-user rank",
+    )
+    cutoffs=tuple(int(k) for k in cutoffs); recalls={k:0. for k in cutoffs}; users_hit={k:0 for k in cutoffs}
+    unique_ads: set[str] = set(); rows = 0
+    for user, candidates in _candidate_groups(candidate_path, chunk_size, has_explicit_rank=has_explicit_rank):
         target = positives.get(user)
         if not target: continue
+        rows += len(candidates); unique_ads.update(ad for ad, _ in candidates)
         ranks = {ad: rank for ad, rank in candidates}
-        for cutoff in hits:
+        for cutoff in cutoffs:
             matched = sum(ad in ranks and ranks[ad] <= cutoff for ad in target)
             recalls[cutoff] += matched / len(target)
             users_hit[cutoff] += int(matched > 0)
     users = len(positives)
     return {"users_evaluated": users, "average_future_positives_per_user": _divide(sum(map(len, positives.values())), users), "candidate_coverage": _divide(rows, users), "unique_recalled_ads": len(unique_ads), "users_with_hit": users_hit,
-            "metrics": {f"recall@{k}": _divide(recalls[k], users) for k in hits} | {f"hit_rate@{k}": _divide(users_hit[k], users) for k in hits}}
+            "metrics": {f"recall@{k}": _divide(recalls[k], users) for k in cutoffs} | {f"hit_rate@{k}": _divide(users_hit[k], users) for k in cutoffs}}
 
 
 def _evaluate_candidate_mapping(mapping: Mapping[str,list[tuple[str,int]]], positives: Mapping[str,set[str]], cutoffs: Iterable[int]) -> dict[str,Any]:
@@ -324,20 +326,38 @@ def _future_a_sample_weights(labels: np.ndarray, candidate_ad_ids: Iterable[obje
     return weights
 
 
-def _candidate_groups(path:Path,chunk_size:int)->Iterator[tuple[str,list[tuple[str,int]]]]:
-    current=None; rows=[]
-    for chunk in pd.read_csv(path,usecols=["user_id","candidate_ad_id","rank"],chunksize=chunk_size,low_memory=False):
-        for user,ad,rank in chunk.itertuples(index=False,name=None):
-            user,ad=_id(user),_id(ad)
+def _candidate_groups(path:Path,chunk_size:int,*,has_explicit_rank:bool)->Iterator[tuple[str,list[tuple[str,int]]]]:
+    """Yield complete user groups, deriving ranks from ordered RRF rows if needed."""
+    columns=["user_id","candidate_ad_id"] + (["rank"] if has_explicit_rank else [])
+    current=None; rows=[]; completed_users:set[str]=set()
+    for chunk in pd.read_csv(path,usecols=columns,chunksize=chunk_size,low_memory=False):
+        for row in chunk.itertuples(index=False,name=None):
+            user,ad=_id(row[0]),_id(row[1])
             if user is None or ad is None: continue
-            if current is not None and user!=current: yield current,rows; rows=[]
-            current=user; rows.append((ad,int(rank)))
-    if current is not None: yield current,rows
+            if current is not None and user!=current:
+                if current in completed_users:
+                    raise ValueError("Recall candidates must keep each user's rows contiguous for streaming evaluation")
+                completed_users.add(current)
+                yield current,rows; rows=[]
+            current=user
+            rank=_recall_rank(row[2]) if has_explicit_rank else len(rows)+1
+            rows.append((ad,rank))
+    if current is not None:
+        if current in completed_users:
+            raise ValueError("Recall candidates must keep each user's rows contiguous for streaming evaluation")
+        yield current,rows
 
 
 def _id(value:object)->str|None:
     if pd.isna(value): return None
     value=str(value).strip(); return value or None
+def _recall_source_name(path:Path)->str:
+    return "rrf" if path.stem=="fused_candidates" else path.stem.removesuffix("_topk")
+def _recall_rank(value:object)->int:
+    try: rank=float(value)
+    except (TypeError,ValueError) as error: raise ValueError(f"Recall rank must be a positive integer: {value!r}") from error
+    if not rank.is_integer() or rank<=0: raise ValueError(f"Recall rank must be a positive integer: {value!r}")
+    return int(rank)
 def _divide(a:float,b:int)->float: return float(a/b) if b else 0.0
 def _stable(value:str,seed:int)->int: return int.from_bytes(hashlib.blake2b(f"{seed}:{value}".encode(),digest_size=8).digest(),"big")
 def _hash_ids(ids:set[str])->str: return hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest()
