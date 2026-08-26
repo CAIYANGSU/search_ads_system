@@ -198,7 +198,7 @@ fine_rank:
   num_cross_layers: 3
   batch_size: 8192
   inference_batch_size: 32768
-  epochs: 5
+  epochs: 1
   learning_rate: 0.001
   weight_decay: 0.00001
   value_loss_weight: 0.2
@@ -250,5 +250,5 @@ temporal:
     popularity_top_k: 200
     rrf_top_k: 100
   coarse_rank:
-    max_train_rows: 2000000
+    max_train_rows: 1000000
     top_k: 50
