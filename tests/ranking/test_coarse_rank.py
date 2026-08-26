@@ -30,6 +30,7 @@ from search_ads_system.ranking.coarse_rank import (
     stream_coarse_rank_output,
     train_coarse_ranker,
 )
+from search_ads_system.ranking.coarse_rank_diagnostics import diagnose_coarse_rank_samples
 
 
 def _config(tmp_path: Path, *, top_k: int = 2, train: bool = True, chunk_size: int = 3) -> CoarseRankConfig:
@@ -235,3 +236,21 @@ def test_bounded_user_batches_backend_fallback_and_benchmark(tmp_path: Path) -> 
         assert result[1]["candidates_per_second"] > 0
     finally:
         store.close()
+
+
+def test_streaming_sample_diagnosis_reuses_training_labels(tmp_path: Path) -> None:
+    _write_data(tmp_path)
+    report = diagnose_coarse_rank_samples(_config(tmp_path))
+
+    assert report["interaction_side"]["total_interaction_rows"] == 6
+    assert report["interaction_side"]["unique_interaction_users"] == 6
+    assert report["candidate_side"]["total_candidate_rows"] == 18
+    assert report["candidate_side"]["selected_candidate_users"] == 6
+    assert report["overlap"]["overlapping_users"] == 6
+    assert report["positive_funnel"]["candidate_interaction_pair_matches_before_split"] == 6
+    assert report["positive_funnel"]["final_positive_samples"] == 6
+    assert report["negative_sampling"]["expected_training_rows"] == 12
+    assert report["negative_sampling"]["actual_training_rows"] == 12
+    assert report["negative_sampling"]["ratio_is_exact"]
+    assert report["exclusion_reasons"]["product_not_in_interactions"] == 12
+    assert not (tmp_path / "model.pkl.diagnostics.sqlite").exists()

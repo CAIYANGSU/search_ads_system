@@ -221,33 +221,56 @@ def build_labeled_user_examples(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Create click positives plus deterministic sampled candidate negatives."""
 
-    if candidates.empty:
-        return _empty_examples()
-    rows = candidates.copy()
-    rows["candidate_ad_id"] = rows["candidate_ad_id"].map(_normalise_id)
-    rows = rows.dropna(subset=["candidate_ad_id"])
-    interactions = feature_store.interactions_for(rows["candidate_ad_id"].tolist(), user_id)
-    rows["_interaction"] = rows["candidate_ad_id"].map(interactions)
-    positive_mask = rows["_interaction"].notna()
-    positives = rows.loc[positive_mask].copy()
-    if positives.empty:
-        return _empty_examples()
-    negatives = deterministic_negative_sample(
-        rows.loc[~positive_mask],
+    selected, group_timestamp = build_labeled_candidate_rows(
+        candidates,
         user_id=user_id,
-        count=len(positives) * negatives_per_positive,
+        interactions=feature_store.interactions_for(candidates["candidate_ad_id"].astype(str).tolist(), user_id),
+        negatives_per_positive=negatives_per_positive,
         random_seed=random_seed,
     )
-    selected = pd.concat((positives, negatives), ignore_index=True)
+    if selected.empty:
+        return _empty_examples()
     selected = feature_store.enrich(selected)
     labels = selected["_interaction"].notna().to_numpy(dtype=np.int8)
     weights = np.ones(len(selected), dtype=np.float32)
     for row_index, interaction in enumerate(selected["_interaction"]):
         if isinstance(interaction, tuple) and int(interaction[1]) == 1:
             weights[row_index] = conversion_sample_weight
-    timestamps = [entry[0] for entry in positives["_interaction"] if entry is not None and entry[0] is not None]
-    group_timestamp = int(max(timestamps)) if timestamps else -1
     return preprocess_features(selected), labels, weights, group_timestamp
+
+
+def build_labeled_candidate_rows(
+    candidates: pd.DataFrame,
+    *,
+    user_id: str,
+    interactions: Mapping[str, tuple[int | None, int]],
+    negatives_per_positive: int,
+    random_seed: int,
+) -> tuple[pd.DataFrame, int]:
+    """Apply the shared click-label and deterministic-negative sampling policy.
+
+    This intentionally excludes feature enrichment so diagnostics can use the
+    exact training-label semantics without allocating a model feature matrix.
+    """
+
+    if candidates.empty:
+        return candidates.iloc[0:0].copy(), -1
+    rows = candidates.copy()
+    rows["candidate_ad_id"] = rows["candidate_ad_id"].map(_normalise_id)
+    rows = rows.dropna(subset=["candidate_ad_id"])
+    rows["_interaction"] = rows["candidate_ad_id"].map(interactions)
+    positives = rows.loc[rows["_interaction"].notna()].copy()
+    if positives.empty:
+        return rows.iloc[0:0].copy(), -1
+    negatives = deterministic_negative_sample(
+        rows.loc[rows["_interaction"].isna()],
+        user_id=user_id,
+        count=len(positives) * negatives_per_positive,
+        random_seed=random_seed,
+    )
+    selected = pd.concat((positives, negatives), ignore_index=True)
+    timestamps = [entry[0] for entry in positives["_interaction"] if isinstance(entry, tuple) and entry[0] is not None]
+    return selected, int(max(timestamps)) if timestamps else -1
 
 
 def collect_training_data(config: CoarseRankConfig, feature_store: "SQLiteFeatureStore") -> TrainingData:
@@ -439,6 +462,71 @@ class SQLiteFeatureStore:
                 result[str(candidate_id)] = (None if timestamp is None else int(timestamp), int(conversion))
         return result
 
+    def interactions_for_groups(
+        self, user_groups: Sequence[tuple[str, pd.DataFrame]]
+    ) -> list[dict[str, tuple[int | None, int]]]:
+        """Bulk join complete user groups against the interaction primary key.
+
+        A temporary SQLite table is limited to the caller's micro-batch.  It
+        replaces hundreds of thousands of per-user queries without persisting
+        candidate pairs or changing the click-positive definition.
+        """
+
+        self.connection.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS coarse_rank_diagnostic_pairs (group_index INTEGER NOT NULL, user_id TEXT NOT NULL, candidate_ad_id TEXT NOT NULL)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS coarse_rank_diagnostic_pairs_lookup ON coarse_rank_diagnostic_pairs (user_id, candidate_ad_id)"
+        )
+        self.connection.execute("DELETE FROM coarse_rank_diagnostic_pairs")
+        pair_rows: list[tuple[int, str, str]] = []
+        for group_index, (user_id, candidates) in enumerate(user_groups):
+            for candidate_id in candidates["candidate_ad_id"]:
+                normalised = _normalise_id(candidate_id)
+                if normalised is not None:
+                    pair_rows.append((group_index, user_id, normalised))
+        self.connection.executemany("INSERT INTO coarse_rank_diagnostic_pairs VALUES (?, ?, ?)", pair_rows)
+        matches: list[dict[str, tuple[int | None, int]]] = [{} for _ in user_groups]
+        query = (
+            "SELECT pairs.group_index, pairs.candidate_ad_id, interactions.click_timestamp, interactions.conversion_label "
+            "FROM coarse_rank_diagnostic_pairs AS pairs "
+            "INNER JOIN interactions ON interactions.user_id = pairs.user_id AND interactions.candidate_ad_id = pairs.candidate_ad_id"
+        )
+        for group_index, candidate_id, timestamp, conversion in self.connection.execute(query):
+            matches[int(group_index)][str(candidate_id)] = (None if timestamp is None else int(timestamp), int(conversion))
+        return matches
+
+    def interaction_users(self, user_ids: Sequence[str]) -> set[str]:
+        """Return which normalized IDs occur in the unified interaction data."""
+
+        result: set[str] = set()
+        for batch in _batches(list(dict.fromkeys(user_ids)), _SQLITE_QUERY_BATCH_SIZE):
+            placeholders = ",".join("?" for _ in batch)
+            result.update(str(row[0]) for row in self.connection.execute(f"SELECT user_id FROM interaction_users WHERE user_id IN ({placeholders})", batch))
+        return result
+
+    def known_ad_ids(self, candidate_ids: Sequence[str]) -> set[str]:
+        """Return candidate IDs that occur as a product in interactions."""
+
+        result: set[str] = set()
+        for batch in _batches(list(dict.fromkeys(candidate_ids)), _SQLITE_QUERY_BATCH_SIZE):
+            placeholders = ",".join("?" for _ in batch)
+            result.update(str(row[0]) for row in self.connection.execute(f"SELECT candidate_ad_id FROM ad_features WHERE candidate_ad_id IN ({placeholders})", batch))
+        return result
+
+    def interaction_summary(self) -> dict[str, int | None]:
+        """Read bounded summary metadata captured while building the index."""
+
+        metadata = {key: value for key, value in self.connection.execute("SELECT key, value FROM coarse_rank_index_metadata")}
+        return {
+            "total_interaction_rows": int(metadata.get("total_interaction_rows", 0)),
+            "conversion_positive_rows": int(metadata.get("conversion_positive_rows", 0)),
+            "interaction_time_min": _safe_int(metadata.get("interaction_time_min")),
+            "interaction_time_max": _safe_int(metadata.get("interaction_time_max")),
+            "unique_interaction_users": int(self.connection.execute("SELECT COUNT(*) FROM interaction_users").fetchone()[0]),
+            "unique_interaction_products": int(self.connection.execute("SELECT COUNT(*) FROM ad_features").fetchone()[0]),
+        }
+
     def enrich(self, candidates: pd.DataFrame) -> pd.DataFrame:
         """Attach product features with a per-batch fallback map.
 
@@ -512,9 +600,14 @@ def build_interaction_feature_index(config: CoarseRankConfig, database_path: Pat
         connection.execute(
             "CREATE TABLE interactions (user_id TEXT NOT NULL, candidate_ad_id TEXT NOT NULL, click_timestamp INTEGER, conversion_label INTEGER NOT NULL, PRIMARY KEY (user_id, candidate_ad_id))"
         )
+        connection.execute("CREATE TABLE interaction_users (user_id TEXT PRIMARY KEY)")
+        connection.execute("CREATE TABLE coarse_rank_index_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         columns = ", ".join(("candidate_ad_id TEXT PRIMARY KEY", "product_price REAL", "clicks_last_7d REAL") + tuple(f"{column} TEXT" for column in CATEGORICAL_AD_FEATURE_COLUMNS))
         connection.execute(f"CREATE TABLE ad_features ({columns})")
         rows_seen = 0
+        conversion_positive_rows = 0
+        time_min: int | None = None
+        time_max: int | None = None
         for chunk in _iter_interaction_chunks(config.interaction_path, config.chunk_size):
             required = {"user_id", "product_id", "conversion_label"}
             missing = required - set(chunk.columns)
@@ -522,6 +615,14 @@ def build_interaction_feature_index(config: CoarseRankConfig, database_path: Pat
                 raise ValueError(f"Unified interactions are missing required columns: {sorted(missing)}")
             interaction_rows: list[tuple[Any, ...]] = []
             feature_rows: list[tuple[Any, ...]] = []
+            interaction_user_rows: list[tuple[str]] = []
+            conversion_values = pd.to_numeric(chunk["conversion_label"], errors="coerce")
+            conversion_positive_rows += int((conversion_values == 1).sum())
+            timestamp_values = pd.to_numeric(chunk.get("click_timestamp", pd.Series(dtype="float64")), errors="coerce").dropna()
+            if not timestamp_values.empty:
+                chunk_min, chunk_max = int(timestamp_values.min()), int(timestamp_values.max())
+                time_min = chunk_min if time_min is None else min(time_min, chunk_min)
+                time_max = chunk_max if time_max is None else max(time_max, chunk_max)
             for row in chunk.itertuples(index=False):
                 values = row._asdict()
                 user_id, candidate_id = _normalise_id(values.get("user_id")), _normalise_id(values.get("product_id"))
@@ -530,16 +631,28 @@ def build_interaction_feature_index(config: CoarseRankConfig, database_path: Pat
                 timestamp = _safe_int(values.get("click_timestamp"))
                 conversion = 1 if _safe_int(values.get("conversion_label")) == 1 else 0
                 interaction_rows.append((user_id, candidate_id, timestamp, conversion))
+                interaction_user_rows.append((user_id,))
                 feature_rows.append((candidate_id, _safe_float(values.get("product_price")), _safe_float(values.get("clicks_last_7d"))) + tuple(_safe_category(values.get(column)) for column in CATEGORICAL_AD_FEATURE_COLUMNS))
             connection.executemany(
                 "INSERT INTO interactions VALUES (?, ?, ?, ?) ON CONFLICT(user_id, candidate_ad_id) DO UPDATE SET click_timestamp = CASE WHEN excluded.click_timestamp > interactions.click_timestamp THEN excluded.click_timestamp ELSE interactions.click_timestamp END, conversion_label = MAX(interactions.conversion_label, excluded.conversion_label)",
                 interaction_rows,
             )
+            connection.executemany("INSERT OR IGNORE INTO interaction_users VALUES (?)", interaction_user_rows)
             placeholders = ",".join("?" for _ in range(1 + len(NUMERIC_AD_FEATURE_COLUMNS) + len(CATEGORICAL_AD_FEATURE_COLUMNS)))
             connection.executemany(f"INSERT OR IGNORE INTO ad_features VALUES ({placeholders})", feature_rows)
             connection.commit()
             rows_seen += len(chunk)
             LOGGER.info("Indexed interactions=%s", rows_seen)
+        connection.executemany(
+            "INSERT INTO coarse_rank_index_metadata VALUES (?, ?)",
+            (
+                ("total_interaction_rows", str(rows_seen)),
+                ("conversion_positive_rows", str(conversion_positive_rows)),
+                ("interaction_time_min", "" if time_min is None else str(time_min)),
+                ("interaction_time_max", "" if time_max is None else str(time_max)),
+            ),
+        )
+        connection.commit()
     finally:
         connection.close()
     return SQLiteFeatureStore(database_path, config.feature_cache_size)
