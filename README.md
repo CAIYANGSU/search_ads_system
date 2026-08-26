@@ -114,6 +114,25 @@ PYTHONPATH=src python src/pipeline/run_coarse_rank.py --config config.yaml
 
 训练最多保留 `coarse_rank.max_train_rows`（默认 200 万）条样本；交互及商品属性写入临时 SQLite 索引，候选读取、特征查询和输出均流式执行。最终原子写入 `outputs/ranking/coarse_rank_topk.csv`，每个用户保留最多 50 条，按 `coarse_score DESC, rrf_score DESC, candidate_ad_id ASC` 排序。RRF 候选没有请求生成时刻，因此时间切分仅是可复现的离线基线，日志会明确提示这一限制。
 
+## Fine Ranking
+
+精排使用 PyTorch DCNv2 的共享 Cross/Deep backbone，并输出 click-conditioned
+`pCVR` 与条件转化金额两个 head。训练样本只取 coarse candidate 与真实点击交互
+重合的 `(user_id, product_id)`；未点击候选不会被伪造为 CVR negative。金额 Huber
+loss 只在 `conversion_label=1` 且金额非空时启用，最终排序分数为离线 proxy：
+`pCVR × predicted_conversion_value`，不等同于 CTR、eCPM 或线上收入。
+
+```bash
+# build_dataset | train | evaluate | infer | all
+PYTHONPATH=src python src/pipeline/run_fine_rank.py --config config.yaml --stage all
+```
+
+训练数据会以 Parquet 分片缓存至
+`outputs/ranking/fine_rank/train/part-*.parquet`，并保存可复用的 metadata 与
+Past/full feature SQLite index。`fine_rank.mode: temporal` 会强制使用
+`outputs/temporal/` 下的 temporal coarse candidates、Past features、Future-A
+training labels 与 Future-B validation labels，避免覆盖 full-data 产物。
+
 ## 开发与验证
 
 ```bash

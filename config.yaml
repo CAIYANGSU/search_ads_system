@@ -181,6 +181,38 @@ coarse_rank:
   # HistGBDT is CPU-only. A requested experimental GPU backend falls back with a log.
   enable_gpu_if_available: false
 
+# Click-conditioned CVR/value fine rank. It intentionally does not train a
+# pseudo-CTR model: only observed click interactions become training rows.
+fine_rank:
+  enabled: true
+  mode: full
+  input_path: outputs/ranking/coarse_rank_topk.csv
+  output_path: outputs/ranking/fine_rank_topk.csv
+  model_path: outputs/models/fine_rank_dcnv2.pt
+  cache_dir: outputs/ranking/fine_rank/train
+  model: dcnv2
+  top_k: 20
+  max_train_rows: 3000000
+  embedding_dim: 32
+  hidden_dims: [256, 128, 64]
+  num_cross_layers: 3
+  batch_size: 8192
+  inference_batch_size: 32768
+  epochs: 5
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  value_loss_weight: 0.2
+  device: auto
+  num_workers: 12
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  amp: true
+  early_stopping:
+    enabled: true
+    patience: 2
+  train: true
+
 ranking:
   model: deepfm
   hidden_dims: [256, 128]
