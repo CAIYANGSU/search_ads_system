@@ -61,6 +61,7 @@ class FineRankConfig:
     weight_decay: float = 0.00001
     value_loss_weight: float = 0.2
     value_log_clip_max: float = 20.0
+    gradient_clip_norm: float = 5.0
     num_workers: int = 12
     prefetch_factor: int = 4
     pin_memory: bool = True
@@ -121,7 +122,7 @@ def parse_fine_rank_config(raw_config: Mapping[str, Any], config_path: Path) -> 
         top_k=int(options.get("top_k", 20)), max_train_rows=int(options.get("max_train_rows", 3_000_000)), chunk_size=int(options.get("chunk_size", 200_000)),
         embedding_dim=int(options.get("embedding_dim", 32)), hidden_dims=tuple(int(value) for value in options.get("hidden_dims", (256, 128, 64))), num_cross_layers=int(options.get("num_cross_layers", 3)),
         batch_size=int(options.get("batch_size", 8192)), inference_batch_size=int(options.get("inference_batch_size", options.get("batch_size", 8192) * 4)), epochs=int(options.get("epochs", 5)),
-        learning_rate=float(options.get("learning_rate", 0.001)), weight_decay=float(options.get("weight_decay", 0.00001)), value_loss_weight=float(options.get("value_loss_weight", 0.2)), value_log_clip_max=float(options.get("value_log_clip_max", 20.0)),
+        learning_rate=float(options.get("learning_rate", 0.001)), weight_decay=float(options.get("weight_decay", 0.00001)), value_loss_weight=float(options.get("value_loss_weight", 0.2)), value_log_clip_max=float(options.get("value_log_clip_max", 20.0)), gradient_clip_norm=float(options.get("gradient_clip_norm", 5.0)),
         num_workers=int(options.get("num_workers", min(12, max(1, os.cpu_count() or 1)))), prefetch_factor=int(options.get("prefetch_factor", 4)), pin_memory=bool(options.get("pin_memory", True)), persistent_workers=bool(options.get("persistent_workers", True)),
         amp=bool(options.get("amp", True)), device=str(options.get("device", "auto")), train=bool(options.get("train", True)), early_stopping=bool(early.get("enabled", True)), patience=int(early.get("patience", 2)), validation_fraction=float(options.get("validation_fraction", 0.1)), random_seed=seed, oom_retries=int(options.get("oom_retries", 3)), bucket_sizes=bucket_sizes,
     )
@@ -182,10 +183,16 @@ def _train_once(config: FineRankConfig, metadata: Mapping[str, Any], device: tor
             with torch.amp.autocast(device_type=device.type, enabled=config.amp and device.type == "cuda"):
                 logits, predicted_log_value = model(dense, sparse)
                 total, cvr, value = multitask_loss(logits, predicted_log_value, labels, values, masks, config.value_loss_weight)
-            scaler.scale(total).backward(); scaler.step(optimizer); scaler.update()
+            if not torch.isfinite(total):
+                raise FloatingPointError("Fine-rank loss became non-finite before the optimizer update")
+            scaler.scale(total).backward()
+            scaler.unscale_(optimizer)
+            gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm, error_if_nonfinite=True)
+            scaler.step(optimizer); scaler.update()
+            _assert_finite_parameters(model)
             current_rows = len(labels); totals += np.asarray((float(total.detach()), float(cvr.detach()), float(value.detach()))) * current_rows; rows += current_rows; batches += 1
         elapsed = time.perf_counter() - started
-        record: dict[str, Any] = {"epoch": epoch, "train_loss": float(totals[0] / rows), "cvr_loss": float(totals[1] / rows), "value_loss": float(totals[2] / rows), "rows_per_second": rows / elapsed if elapsed else 0.0, "batches_per_second": batches / elapsed if elapsed else 0.0, "elapsed_seconds": elapsed, "batch_size": batch_size}
+        record: dict[str, Any] = {"epoch": epoch, "train_loss": float(totals[0] / rows), "cvr_loss": float(totals[1] / rows), "value_loss": float(totals[2] / rows), "rows_per_second": rows / elapsed if elapsed else 0.0, "batches_per_second": batches / elapsed if elapsed else 0.0, "elapsed_seconds": elapsed, "batch_size": batch_size, "gradient_norm_last_batch": float(gradient_norm)}
         if device.type == "cuda":
             record["peak_gpu_memory_bytes"] = int(torch.cuda.max_memory_allocated(device)); torch.cuda.reset_peak_memory_stats(device)
         if has_validation:
@@ -408,6 +415,12 @@ def _quantile_summary(values: np.ndarray) -> dict[str, float | None]:
     return {"min": float(values.min()), "median": float(np.median(values)), "p95": float(np.quantile(values, .95)), "p99": float(np.quantile(values, .99)), "max": float(values.max())}
 
 
+def _assert_finite_parameters(model: DCNv2MultiTask) -> None:
+    for name, parameter in model.named_parameters():
+        if not torch.isfinite(parameter).all():
+            raise FloatingPointError(f"Fine-rank optimizer produced non-finite parameter: {name}")
+
+
 def _loader(directory: Path, config: FineRankConfig, *, batch_size: int, value_transform: Mapping[str, float], include_identifiers: bool, force_workers: int | None = None) -> DataLoader[Any]:
     workers = config.num_workers if force_workers is None else force_workers
     os.environ.setdefault("OMP_NUM_THREADS", "1"); os.environ.setdefault("MKL_NUM_THREADS", "1"); os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -436,7 +449,7 @@ def _log_device_config(config: FineRankConfig, device: torch.device) -> None:
 
 def _validate_config(config: FineRankConfig) -> None:
     positive = (config.top_k, config.max_train_rows, config.chunk_size, config.embedding_dim, config.num_cross_layers, config.batch_size, config.inference_batch_size, config.epochs, config.num_workers, config.prefetch_factor)
-    if any(value <= 0 for value in positive) or not 0 <= config.value_loss_weight or not 0 < config.validation_fraction < 1 or config.patience <= 0 or not np.isfinite(config.value_log_clip_max) or config.value_log_clip_max <= 0:
+    if any(value <= 0 for value in positive) or not 0 <= config.value_loss_weight or not 0 < config.validation_fraction < 1 or config.patience <= 0 or not np.isfinite(config.value_log_clip_max) or config.value_log_clip_max <= 0 or not np.isfinite(config.gradient_clip_norm) or config.gradient_clip_norm <= 0:
         raise ValueError("Fine-rank numeric configuration contains an invalid value")
     if len(config.bucket_sizes) != len(SPARSE_FEATURES) or any(value <= 1 for value in config.bucket_sizes):
         raise ValueError("fine_rank hash bucket configuration is invalid")

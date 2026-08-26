@@ -133,6 +133,16 @@ def test_extreme_value_head_is_clamped_before_expm1() -> None:
     assert torch.all(predicted_value >= 0) and torch.allclose(expected, probability * predicted_value)
 
 
+def test_extreme_finite_dense_features_are_bounded_before_cross_network() -> None:
+    frame = pd.DataFrame({"user_id": ["u"], "candidate_ad_id": ["a"], "product_price": [1e300], "clicks_last_7d": [1e300], "coarse_score": [1e300], "conversion_label": [0]})
+    encoded = encode_feature_frame(frame, bucket_sizes=(17,) * len(SPARSE_FEATURES))
+    dense = encoded[[f"dense__{name}" for name in DENSE_FEATURES]].to_numpy(dtype=np.float32)
+    assert np.isfinite(dense).all() and np.abs(dense).max() <= 10.0
+    model = DCNv2MultiTask(dense_dim=len(DENSE_FEATURES), sparse_bucket_sizes=(17,) * len(SPARSE_FEATURES), embedding_dim=4, hidden_dims=(8,), num_cross_layers=2)
+    logits, values = model(torch.from_numpy(dense), torch.zeros(1, len(SPARSE_FEATURES), dtype=torch.long))
+    assert torch.isfinite(logits).all() and torch.isfinite(values).all()
+
+
 def test_checkpoint_train_false_style_load_and_chunked_topk_inference(tmp_path: Path) -> None:
     config = _config(tmp_path)
     metadata = build_dataset(config)
@@ -176,4 +186,4 @@ def test_temporal_uses_past_only_features_with_future_labels(tmp_path: Path) -> 
     build_dataset(config)
     row = next(iter(FineRankParquetDataset(config.cache_dir)))
     assert row["label"] == 1.0
-    assert row["dense"][DENSE_FEATURES.index("product_price")] == 1.0
+    assert row["dense"][DENSE_FEATURES.index("product_price")] == pytest.approx(np.log1p(1.0) / 5.0)

@@ -28,7 +28,7 @@ from search_ads_system.data.storage import iter_csv_parts
 
 LOGGER = logging.getLogger(__name__)
 
-FEATURE_VERSION = "fine-rank-observed-clicks-v2"
+FEATURE_VERSION = "fine-rank-observed-clicks-v3-bounded-dense"
 DATASET_CONSTRUCTION_VERSION = "observed-clicked-interactions-v2"
 VALUE_TRANSFORM_VERSION = "normalized-log1p-v1"
 DENSE_FEATURES = (
@@ -48,6 +48,7 @@ LEAKAGE_COLUMNS = {
 DEFAULT_BUCKET_SIZES = (1_000_003, 1_000_003, 10_007, 10_007, 10_007, 100_003, 100_003, 100_003, 100_003, 10_007)
 PRODUCT_COLUMNS = ("product_price", "product_age_group", "product_gender", "product_brand", "product_category_1", "product_category_2", "product_category_3", "product_country")
 USER_COLUMNS = ("clicks_last_7d", "device_type", "click_timestamp")
+MAX_DENSE_ABS_VALUE = 10.0
 
 
 def assert_no_fine_rank_leakage(feature_columns: Sequence[str]) -> None:
@@ -370,17 +371,19 @@ def encode_feature_frame(frame: pd.DataFrame, *, bucket_sizes: Sequence[int] = D
     clicks = _numeric(frame, "clicks_last_7d")
     timestamp = _numeric(frame, "click_timestamp")
     rank = _numeric(frame, "rank", default=0.0)
+    log_price = _bounded_positive_log(price)
+    log_clicks = _bounded_positive_log(clicks)
     dense = {
-        "rrf_score": _numeric(frame, "rrf_score"), "source_count": _numeric(frame, "source_count"), "coarse_score": _numeric(frame, "coarse_score"),
-        "inverse_coarse_rank": np.divide(1.0, np.maximum(rank, 1.0)), "product_price": np.nan_to_num(price, nan=0.0),
-        "log_product_price": np.log1p(np.maximum(np.nan_to_num(price, nan=0.0), 0.0)), "clicks_last_7d": np.nan_to_num(clicks, nan=0.0),
-        "log_clicks_last_7d": np.log1p(np.maximum(np.nan_to_num(clicks, nan=0.0), 0.0)),
+        "rrf_score": _bounded_signed_log(_numeric(frame, "rrf_score")), "source_count": _bounded_positive_log(_numeric(frame, "source_count")), "coarse_score": _bounded_signed_log(_numeric(frame, "coarse_score")),
+        "inverse_coarse_rank": np.clip(np.divide(1.0, np.maximum(rank, 1.0)), 0.0, 1.0), "product_price": log_price / 5.0,
+        "log_product_price": log_price, "clicks_last_7d": log_clicks / 5.0,
+        "log_clicks_last_7d": log_clicks,
         "click_hour_utc": np.where(np.isfinite(timestamp), (timestamp // 3600 % 24) / 23.0, 0.0),
         "click_day_of_week_utc": np.where(np.isfinite(timestamp), (timestamp // 86400 % 7) / 6.0, 0.0),
         "product_price_missing": (~np.isfinite(price)).astype(np.float32), "clicks_last_7d_missing": (~np.isfinite(clicks)).astype(np.float32), "timestamp_missing": (~np.isfinite(timestamp)).astype(np.float32),
     }
     for name, values in dense.items():
-        output[f"dense__{name}"] = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        output[f"dense__{name}"] = np.clip(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0), -MAX_DENSE_ABS_VALUE, MAX_DENSE_ABS_VALUE).astype(np.float32)
     for index, (name, bucket) in enumerate(zip(SPARSE_FEATURES, bucket_sizes)):
         source = output["candidate_ad_id"] if name == "product_id" else output["user_id"] if name == "user_id" else frame.get(name, pd.Series(None, index=frame.index))
         output[f"sparse__{name}"] = [stable_hash(value, int(bucket), random_seed + index) for value in source]
@@ -516,6 +519,18 @@ def _numeric(frame: pd.DataFrame, column: str, default: float = 0.0) -> np.ndarr
     if column not in frame:
         return np.full(len(frame), default, dtype=np.float64)
     return pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=np.float64)
+
+
+def _bounded_positive_log(values: np.ndarray) -> np.ndarray:
+    """Represent unbounded non-negative counts/prices in a bounded log space."""
+    safe = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.clip(np.log1p(np.maximum(safe, 0.0)), 0.0, MAX_DENSE_ABS_VALUE)
+
+
+def _bounded_signed_log(values: np.ndarray) -> np.ndarray:
+    """Preserve score ordering while preventing a finite outlier from exploding CrossNet."""
+    safe = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.clip(np.sign(safe) * np.log1p(np.abs(safe)), -MAX_DENSE_ABS_VALUE, MAX_DENSE_ABS_VALUE)
 
 
 def _normalise_id(value: object) -> str | None:

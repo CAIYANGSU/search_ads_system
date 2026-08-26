@@ -123,6 +123,8 @@ CVR negative。金额 Huber loss 使用 train split 统计量标准化后的 `lo
 仅在 `conversion_label=1` 且金额有限、非负时启用；解码前裁剪 predicted log value，
 最终排序分数为离线 proxy：
 `pCVR × predicted_conversion_value`，不等同于 CTR、eCPM 或线上收入。
+输入的连续特征采用有界 log 表示，Cross Network 的乘性交叉固定在 fp32，训练使用
+gradient clipping；任何非有限输入、梯度、参数或预测都会显式失败并报告，而不会被跳过。
 
 ```bash
 # build_dataset | train | evaluate | infer | all

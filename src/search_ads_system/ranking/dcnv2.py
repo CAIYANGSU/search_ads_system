@@ -11,6 +11,7 @@ from collections.abc import Sequence
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 
 class CrossNetworkV2(nn.Module):
@@ -23,9 +24,15 @@ class CrossNetworkV2(nn.Module):
         self.layers = nn.ModuleList(nn.Linear(input_dim, input_dim, bias=True) for _ in range(num_layers))
 
     def forward(self, x0: Tensor) -> Tensor:
-        x = x0
-        for layer in self.layers:
-            x = x0 * layer(x) + x
+        # Cross terms multiply two activations and are particularly susceptible
+        # to fp16 overflow.  Keep them in fp32 even when the MLP uses AMP.
+        x0_float = x0.float()
+        x = x0_float
+        for index, layer in enumerate(self.layers):
+            projection = F.linear(x, layer.weight.float(), layer.bias.float())
+            x = x0_float * projection + x
+            if not torch.isfinite(x).all():
+                raise FloatingPointError(f"DCNv2 cross layer {index} produced non-finite activations")
         return x
 
 
@@ -52,6 +59,7 @@ class DCNv2MultiTask(nn.Module):
         self.embedding_dim = embedding_dim
         self.embeddings = nn.ModuleList(nn.Embedding(size, embedding_dim) for size in self.sparse_bucket_sizes)
         input_dim = dense_dim + len(self.embeddings) * embedding_dim
+        self.input_norm = nn.LayerNorm(input_dim)
         self.cross = CrossNetworkV2(input_dim, num_cross_layers)
         deep_layers: list[nn.Module] = []
         previous = input_dim
@@ -82,10 +90,15 @@ class DCNv2MultiTask(nn.Module):
             raise ValueError(f"dense must have shape [batch, {self.dense_dim}]")
         if sparse.ndim != 2 or sparse.shape[1] != len(self.embeddings):
             raise ValueError(f"sparse must have shape [batch, {len(self.embeddings)}]")
+        if not torch.isfinite(dense).all():
+            raise FloatingPointError("Fine-rank input dense features contain non-finite values")
         embedded = [embedding(sparse[:, index].remainder(embedding.num_embeddings)) for index, embedding in enumerate(self.embeddings)]
-        x = torch.cat((dense, *embedded), dim=1)
+        x = self.input_norm(torch.cat((dense, *embedded), dim=1))
         shared = torch.cat((self.cross(x), self.deep(x)), dim=1)
-        return self.cvr_head(shared).squeeze(1), self.value_head(shared).squeeze(1)
+        logits, value = self.cvr_head(shared).squeeze(1), self.value_head(shared).squeeze(1)
+        if not torch.isfinite(logits).all() or not torch.isfinite(value).all():
+            raise FloatingPointError("DCNv2 heads produced non-finite activations")
+        return logits, value
 
     @torch.no_grad()
     def predict(self, dense: Tensor, sparse: Tensor) -> tuple[Tensor, Tensor, Tensor]:
