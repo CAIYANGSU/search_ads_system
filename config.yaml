@@ -196,3 +196,24 @@ auction:
 
 evaluation:
   metrics: [auc, logloss, ndcg]
+
+# Isolated strict-time offline experiment.  Artifacts stay below outputs/temporal
+# and must never reuse full-data recall checkpoints or fused candidates.
+temporal:
+  enabled: true
+  output_dir: outputs/temporal
+  chunk_size: 200000
+  split:
+    timestamp_column: click_timestamp
+    past_ratio: 0.8
+  users:
+    max_users: 100000
+    seed: 2026
+  recall:
+    itemcf_top_k: 100
+    two_tower_top_k: 100
+    popularity_top_k: 200
+    rrf_top_k: 100
+  coarse_rank:
+    max_train_rows: 2000000
+    top_k: 50
