@@ -2,7 +2,7 @@
 
 面向电商商品广告的排序系统。项目以商品、用户、设备、类目和广告交互特征为输入，为广告候选的 CTR 预测、概率校准、eCPM 排序及 GSP auction simulation 提供一致的数据与模块边界。
 
-当前已实现的是稳定、可复现的数据处理 pipeline；它不训练模型，也不执行在线排序或拍卖。现有 Criteo 转化数据只包含点击后的转化信息，适合保留商品广告的转化与价值信号。要训练可用的 CTR 模型，还需接入带曝光与点击标签的商品广告日志；该前提不会改变当前数据处理产物或实验结果。
+当前已实现稳定、可复现的数据处理与召回 pipeline，并提供一个轻量、离线的粗排基线。现有 Criteo 转化数据只包含点击后的转化信息，适合保留商品广告的转化与价值信号；要训练可用的线上 CTR 模型，仍需接入带曝光与点击标签的商品广告日志。
 
 ## 排序目标与预留能力
 
@@ -103,6 +103,16 @@ EDA 使用分块累积统计，输出总体行数、转化数/转化率、每列
 ## 定位与兼容性
 
 项目名称已调整为 Product Ads Ranking System；Python 包名、配置键、原始数据目录和所有命令保持不变，以保证既有实验结果与运行方式完全兼容。原始目录中的 `Search` 是 Criteo 数据集的来源名称，并非项目的产品定位。
+
+## Coarse Ranking
+
+粗排读取 RRF 的 `fused_candidates.csv`，以真实的 `(user_id, product_id)` 点击交互作为正样本、同一用户未交互的候选作为确定性采样负样本，并把转换样本的训练权重提高到 3。`conversion_label`、转换金额、转换延迟、时间戳和 ID 都不会作为模型特征。第一版采用 CPU 友好的 `HistGradientBoostingClassifier`，输入为 RRF 分数/来源数、商品价格/近 7 日点击数及稳定哈希后的低成本商品属性。
+
+```bash
+PYTHONPATH=src python src/pipeline/run_coarse_rank.py --config config.yaml
+```
+
+训练最多保留 `coarse_rank.max_train_rows`（默认 200 万）条样本；交互及商品属性写入临时 SQLite 索引，候选读取、特征查询和输出均流式执行。最终原子写入 `outputs/ranking/coarse_rank_topk.csv`，每个用户保留最多 50 条，按 `coarse_score DESC, rrf_score DESC, candidate_ad_id ASC` 排序。RRF 候选没有请求生成时刻，因此时间切分仅是可复现的离线基线，日志会明确提示这一限制。
 
 ## 开发与验证
 

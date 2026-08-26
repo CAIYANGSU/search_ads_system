@@ -155,6 +155,23 @@ prerank:
   model: placeholder
   top_k: 100
 
+coarse_rank:
+  input_path: outputs/recall_candidates/fused_candidates.csv
+  interaction_path: outputs/processed/criteo_unified
+  output_path: outputs/ranking/coarse_rank_topk.csv
+  model_path: outputs/models/coarse_rank_model.pkl
+  train: true
+  max_train_rows: 2000000
+  max_users: 500000
+  top_k: 50
+  chunk_size: 200000
+  random_seed: 2026
+  negative_sampling:
+    negatives_per_positive: 5
+  conversion_sample_weight: 3.0
+  # Bounded product-feature lookup cache for streaming inference.
+  feature_cache_size: 100000
+
 ranking:
   model: deepfm
   hidden_dims: [256, 128]
