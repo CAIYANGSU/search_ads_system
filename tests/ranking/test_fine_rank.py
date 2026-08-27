@@ -13,6 +13,8 @@ import torch
 from search_ads_system.ranking.dcnv2 import DCNv2MultiTask
 from search_ads_system.ranking.fine_rank import (
     FineRankConfig,
+    _attach_inference_prediction_columns,
+    _rank_inference_candidates,
     benchmark_fine_rank_inference_preprocessing,
     build_dataset,
     build_model,
@@ -161,6 +163,39 @@ def test_checkpoint_train_false_style_load_and_chunked_topk_inference(tmp_path: 
     assert ranked.groupby("user_id").size().eq(2).all()
     assert ranked.groupby("user_id")["rank"].apply(lambda ranks: ranks.tolist() == [1, 2]).all()
     assert np.allclose(ranked.expected_value_score, ranked.pCVR * ranked.predicted_conversion_value)
+
+
+def test_float16_gpu_predictions_are_promoted_before_pandas_ranking() -> None:
+    identifiers = pd.DataFrame(
+        {
+            "user_id": pd.Series(["u2", "u1", "u1", "u2"], dtype="string"),
+            "candidate_ad_id": pd.Series(["a1", "a2", "a1", "a2"], dtype="string"),
+        }
+    )
+    float16_predictions = {
+        "p_cvr": np.asarray([.3, .5, .5, .3], dtype=np.float16),
+        "predicted_log_value": np.asarray([1.0, 2.0, 1.5, 2.5], dtype=np.float16),
+        "predicted_value": np.asarray([3.0, 4.0, 2.0, 5.0], dtype=np.float16),
+        "expected_value": np.asarray([.9, 2.0, 1.0, 1.5], dtype=np.float16),
+    }
+    half_frame = identifiers.copy()
+    _attach_inference_prediction_columns(half_frame, **float16_predictions)
+    assert all(half_frame[column].dtype == np.dtype("float32") for column in (
+        "pCVR", "predicted_log_conversion_value", "predicted_conversion_value", "expected_value_score",
+    ))
+    assert str(half_frame["user_id"].dtype) == "string"
+    assert str(half_frame["candidate_ad_id"].dtype) == "string"
+    ranked_half = _rank_inference_candidates(half_frame, top_k=2)
+
+    reference_frame = identifiers.copy()
+    _attach_inference_prediction_columns(
+        reference_frame,
+        **{name: values.astype(np.float32) for name, values in float16_predictions.items()},
+    )
+    ranked_reference = _rank_inference_candidates(reference_frame, top_k=2)
+    assert ranked_half[["user_id", "candidate_ad_id", "rank"]].equals(
+        ranked_reference[["user_id", "candidate_ad_id", "rank"]]
+    )
 
 
 def test_vectorized_100k_candidate_preprocessing_benchmark(tmp_path: Path) -> None:

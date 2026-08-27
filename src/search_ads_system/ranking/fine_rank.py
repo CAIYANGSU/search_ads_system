@@ -270,6 +270,7 @@ def infer_fine_rank(config: FineRankConfig) -> dict[str, Any]:
     started = time.perf_counter(); written = 0; processed = 0; batches = 0; diagnostics = _PredictionDiagnostics()
     timings = {"feature_index_load_seconds": 0.0, "candidate_read_seconds": 0.0, "feature_preparation_seconds": 0.0, "gpu_scoring_seconds": 0.0, "ranking_seconds": 0.0, "write_seconds": 0.0}
     next_progress = config.inference_progress_rows
+    dtype_diagnostics_logged = False
     try:
         with temporary.open("w", newline="", encoding="utf-8") as file:
             file.write("user_id,candidate_ad_id,pCVR,predicted_conversion_value,expected_value_score,rank\n"); file.flush()
@@ -288,7 +289,11 @@ def infer_fine_rank(config: FineRankConfig) -> dict[str, Any]:
                     except StopIteration:
                         break
                     timings["candidate_read_seconds"] += time.perf_counter() - read_started
-                    rows, output_rows, batch_timings = _score_candidate_frame(frame, model, store, config, device, transform, diagnostics, hash_cache, file)
+                    rows, output_rows, batch_timings = _score_candidate_frame(
+                        frame, model, store, config, device, transform, diagnostics,
+                        hash_cache, file, log_sort_dtypes=not dtype_diagnostics_logged,
+                    )
+                    dtype_diagnostics_logged = True
                     processed += rows; written += output_rows; batches += 1
                     for name, value in batch_timings.items(): timings[name] += value
                     if processed >= next_progress:
@@ -371,32 +376,94 @@ def resolve_device(option: str) -> torch.device:
     return requested
 
 
-def _score_candidate_frame(frame: pd.DataFrame, model: DCNv2MultiTask, store: FineRankFeatureStore, config: FineRankConfig, device: torch.device, value_transform: Mapping[str, float], diagnostics: "_PredictionDiagnostics", hash_cache: SparseHashCache, file: Any) -> tuple[int, int, dict[str, float]]:
+def _score_candidate_frame(frame: pd.DataFrame, model: DCNv2MultiTask, store: FineRankFeatureStore, config: FineRankConfig, device: torch.device, value_transform: Mapping[str, float], diagnostics: "_PredictionDiagnostics", hash_cache: SparseHashCache, file: Any, *, log_sort_dtypes: bool = False) -> tuple[int, int, dict[str, float]]:
     timings = {"feature_preparation_seconds": 0.0, "gpu_scoring_seconds": 0.0, "ranking_seconds": 0.0, "write_seconds": 0.0}
     started = time.perf_counter()
     encoded = encode_feature_frame(store.enrich(frame), bucket_sizes=config.bucket_sizes, random_seed=config.random_seed, hash_cache=hash_cache)
     timings["feature_preparation_seconds"] = time.perf_counter() - started
     dense_values = encoded[[f"dense__{name}" for name in DENSE_FEATURES]].to_numpy(dtype=np.float32, copy=False)
     sparse_values = encoded[[f"sparse__{name}" for name in SPARSE_FEATURES]].to_numpy(dtype=np.int64, copy=False)
-    probabilities: list[np.ndarray] = []; values: list[np.ndarray] = []; expected_values: list[np.ndarray] = []
+    probabilities: list[np.ndarray] = []
+    predicted_logs: list[np.ndarray] = []
+    values: list[np.ndarray] = []
+    expected_values: list[np.ndarray] = []
     started = time.perf_counter(); model.eval()
     with torch.no_grad(), torch.amp.autocast(device_type=device.type, enabled=config.amp and device.type == "cuda"):
         for offset in range(0, len(encoded), config.inference_batch_size):
             dense = torch.as_tensor(dense_values[offset : offset + config.inference_batch_size], device=device)
             sparse = torch.as_tensor(sparse_values[offset : offset + config.inference_batch_size], device=device)
             probability, predicted_log_value, value, expected = model.predict_with_log(dense, sparse, **_prediction_kwargs(value_transform))
-            diagnostics.update(predicted_log_value.cpu().numpy(), value.cpu().numpy())
-            probabilities.append(probability.cpu().numpy()); values.append(value.cpu().numpy()); expected_values.append(expected.cpu().numpy())
+            # AMP may return float16 tensors.  Pandas cannot build a float16
+            # index for sort keys, so make the inference-to-pandas boundary
+            # explicit while keeping model execution in AMP.
+            probability_array = probability.detach().to(dtype=torch.float32).cpu().numpy()
+            predicted_log_array = predicted_log_value.detach().to(dtype=torch.float32).cpu().numpy()
+            value_array = value.detach().to(dtype=torch.float32).cpu().numpy()
+            expected_array = expected.detach().to(dtype=torch.float32).cpu().numpy()
+            diagnostics.update(predicted_log_array, value_array)
+            probabilities.append(probability_array)
+            predicted_logs.append(predicted_log_array)
+            values.append(value_array)
+            expected_values.append(expected_array)
     if device.type == "cuda": torch.cuda.synchronize(device)
     timings["gpu_scoring_seconds"] = time.perf_counter() - started
-    encoded["pCVR"] = np.concatenate(probabilities); encoded["predicted_conversion_value"] = np.concatenate(values); encoded["expected_value_score"] = np.concatenate(expected_values)
+    _attach_inference_prediction_columns(
+        encoded,
+        p_cvr=np.concatenate(probabilities),
+        predicted_log_value=np.concatenate(predicted_logs),
+        predicted_value=np.concatenate(values),
+        expected_value=np.concatenate(expected_values),
+    )
+    if log_sort_dtypes:
+        columns = ["user_id", "candidate_ad_id", *_INFERENCE_PREDICTION_COLUMNS]
+        LOGGER.info(
+            "Fine-rank inference first-chunk sort dtypes: %s",
+            {column: str(encoded[column].dtype) for column in columns},
+        )
     started = time.perf_counter()
-    ranked = encoded.sort_values(["user_id", "expected_value_score", "pCVR", "candidate_ad_id"], ascending=[True, False, False, True], kind="mergesort")
-    ranked["rank"] = ranked.groupby("user_id", sort=False).cumcount() + 1
-    output = ranked.loc[ranked["rank"] <= config.top_k, ["user_id", "candidate_ad_id", "pCVR", "predicted_conversion_value", "expected_value_score", "rank"]]
+    output = _rank_inference_candidates(encoded, config.top_k)
     timings["ranking_seconds"] = time.perf_counter() - started
     started = time.perf_counter(); output.to_csv(file, header=False, index=False); timings["write_seconds"] = time.perf_counter() - started
     return len(encoded), len(output), timings
+
+
+_INFERENCE_PREDICTION_COLUMNS = (
+    "pCVR",
+    "predicted_log_conversion_value",
+    "predicted_conversion_value",
+    "expected_value_score",
+)
+
+
+def _attach_inference_prediction_columns(frame: pd.DataFrame, *, p_cvr: np.ndarray, predicted_log_value: np.ndarray, predicted_value: np.ndarray, expected_value: np.ndarray) -> None:
+    """Attach GPU predictions as float32 without altering identifier dtypes."""
+    columns = {
+        "pCVR": p_cvr,
+        "predicted_log_conversion_value": predicted_log_value,
+        "predicted_conversion_value": predicted_value,
+        "expected_value_score": expected_value,
+    }
+    for name, values in columns.items():
+        array = np.asarray(values, dtype=np.float32)
+        if len(array) != len(frame):
+            raise ValueError(f"Fine-rank prediction length mismatch for {name}: {len(array)} != {len(frame)}")
+        if not np.isfinite(array).all():
+            raise FloatingPointError(f"Fine-rank model produced non-finite {name}")
+        frame[name] = array
+
+
+def _rank_inference_candidates(encoded: pd.DataFrame, top_k: int) -> pd.DataFrame:
+    """Stable per-user ranking after the explicit float32 pandas boundary."""
+    ranked = encoded.sort_values(
+        ["user_id", "expected_value_score", "pCVR", "candidate_ad_id"],
+        ascending=[True, False, False, True],
+        kind="mergesort",
+    )
+    ranked["rank"] = ranked.groupby("user_id", sort=False).cumcount() + 1
+    return ranked.loc[
+        ranked["rank"] <= top_k,
+        ["user_id", "candidate_ad_id", "pCVR", "predicted_conversion_value", "expected_value_score", "rank"],
+    ]
 
 
 def _iter_candidate_frames(path: Path, chunk_size: int) -> Iterator[pd.DataFrame]:
