@@ -11,7 +11,6 @@ import pandas as pd
 
 from .auction import group_candidates, run_auction
 from .bidding import synthetic_bid, target_cpa_bid, value_based_bid
-from .pacing import pacing_multipliers
 from .value_scoring import attribution_scores, search_value_scores
 
 
@@ -35,6 +34,8 @@ class SimulationConfig:
     value_based_bid_scale: float = 1.0
     value_prediction_column: str | None = None
     pacing_enabled: bool = True
+    pacing_alpha: float = 0.2
+    pacing_epsilon: float = 1e-12
     pacing_comparison_policies: tuple[str, ...] = ("calibrated_ctcvr_scaled", "target_cpa_bidding")
     trajectory_buckets: int = 10
 
@@ -108,6 +109,7 @@ def simulate_attribution(frame: pd.DataFrame, *, config: SimulationConfig, calib
 def _validate_config(config: SimulationConfig) -> None:
     if not config.budget_levels or any(not 0 < value <= 1 for value in config.budget_levels): raise ValueError("budget_levels must be fractions in (0, 1]")
     if config.trajectory_buckets <= 0: raise ValueError("trajectory_buckets must be positive")
+    if not 0 < config.pacing_alpha <= 1 or config.pacing_epsilon <= 0: raise ValueError("pacing alpha must be in (0, 1] and epsilon positive")
 
 
 def _scored_bids(grouped: pd.DataFrame, spec: Mapping[str, Any], config: SimulationConfig, *, predicted_value: np.ndarray | None = None) -> tuple[pd.DataFrame, str]:
@@ -125,15 +127,14 @@ def _scored_bids(grouped: pd.DataFrame, spec: Mapping[str, Any], config: Simulat
 
 
 def _evaluate_policy(scored: pd.DataFrame, quality_key: str, spec: Mapping[str, Any], config: SimulationConfig) -> tuple[dict[str, Any], list[dict[str, Any]], list[pd.DataFrame]]:
-    _, estimated = run_auction(scored, quality_column=quality_key, bid_column="synthetic_bid", mechanism=config.mechanism)
     levels: dict[str, Any] = {}; rows: list[dict[str, Any]] = []; curves: list[pd.DataFrame] = []
     for level in config.budget_levels:
         budget = config.total_budget * level
         modes = ("no_pacing", "budget_aware_pacing") if config.pacing_enabled and str(spec["name"]) in config.pacing_comparison_policies else ("budget_aware_pacing",)
         by_mode: dict[str, Any] = {}
         for mode in modes:
-            multipliers = None if mode == "no_pacing" else pacing_multipliers(estimated.payment.to_numpy(float), budget=budget, minimum=config.pacing_min, maximum=config.pacing_max)
-            winners, curve = run_auction(scored, quality_column=quality_key, bid_column="synthetic_bid", mechanism=config.mechanism, budget=budget, pacing_multipliers=multipliers)
+            feedback = None if mode == "no_pacing" else {"initial_multiplier": 1.0, "minimum": config.pacing_min, "maximum": config.pacing_max, "alpha": config.pacing_alpha, "epsilon": config.pacing_epsilon}
+            winners, curve = run_auction(scored, quality_column=quality_key, bid_column="synthetic_bid", mechanism=config.mechanism, budget=budget, feedback_pacing=feedback)
             metrics = _attribution_metrics(scored, winners, budget)
             metrics.update(_pacing_metrics(winners, curve, budget, config.trajectory_buckets)); metrics["pacing_mode"] = mode
             by_mode[mode] = metrics
@@ -194,22 +195,23 @@ def _pacing_comparison(results: Mapping[str, Any], config: SimulationConfig) -> 
         result = results.get(name)
         if isinstance(result, Mapping) and result.get("available"):
             policies[name] = {level: value["pacing_comparison"] for level, value in result["budget_levels"].items()}
-    return {"available": bool(policies), "definition": "no_pacing and deterministic budget_aware_pacing share grouped auction order, prediction, budget, and seed", "trajectory_buckets": config.trajectory_buckets, "early_budget_exhaustion_definition": "simulated spend reaches the configured budget before 90% of auction order", "spend_smoothness_definition": "mean absolute deviation between cumulative spend fraction and cumulative horizon fraction", "trajectory_contract": {"cumulative_budget_fraction": "planned linear budget fraction, equal to cumulative horizon fraction", "cumulative_spend_fraction": "actual cumulative spend divided by final simulated spend", "cumulative_impression_fraction": "won impressions divided by final won impressions", "remaining_budget_fraction": "unspent configured budget divided by configured budget"}, "policies": policies}
+    return {"available": bool(policies), "definition": "no_pacing and deterministic feedback budget_aware_pacing share grouped auction order, prediction, budget, and seed", "feedback_formula": "next_multiplier = clip(current_multiplier * (elapsed_horizon_fraction / max(cumulative_spend / total_budget, epsilon)) ** alpha, pacing_min, pacing_max)", "trajectory_buckets": config.trajectory_buckets, "early_budget_exhaustion_definition": "first cumulative_spend_fraction >= 0.99 before 90% of auction order", "spend_smoothness_definition": "mean absolute deviation between cumulative spend fraction and cumulative horizon fraction; lower is smoother", "trajectory_contract": {"cumulative_budget_fraction": "planned linear budget fraction, equal to cumulative horizon fraction", "cumulative_spend_fraction": "actual cumulative spend divided by configured total budget", "cumulative_impression_fraction": "won impressions divided by final won impressions", "remaining_budget_fraction": "unspent configured budget divided by configured budget"}, "policies": policies}
 
 
 def _pacing_metrics(winners: pd.DataFrame, curve: pd.DataFrame, budget: float, buckets: int) -> dict[str, Any]:
     trajectory = _spend_trajectory(winners, curve, budget, buckets)
-    exhausted = curve.loc[curve.cumulative_spend >= budget - 1e-12, "auction_order"]
-    early = bool(len(exhausted) and int(exhausted.iat[0]) + 1 < .9 * max(len(curve), 1))
-    return {"early_budget_exhaustion": early, "spend_smoothness": float(trajectory["spend_smoothness"].iat[0]) if len(trajectory) else None, "spend_trajectory": trajectory.to_dict(orient="records"), "winner_row_indices": winners.loc[winners.won, "winner_row_index"].astype(int).tolist()}
+    spend_fraction = curve.cumulative_spend.to_numpy(float) / budget if budget else np.zeros(len(curve), dtype=float)
+    exhausted = np.flatnonzero(spend_fraction >= .99)
+    exhaustion_fraction = float((int(exhausted[0]) + 1) / len(curve)) if len(exhausted) else None
+    return {"budget_exhaustion_horizon_fraction": exhaustion_fraction, "early_budget_exhaustion": bool(exhaustion_fraction is not None and exhaustion_fraction < .9), "spend_smoothness": float(trajectory["spend_smoothness"].iat[0]) if len(trajectory) else None, "spend_trajectory": trajectory.to_dict(orient="records"), "winner_row_indices": winners.loc[winners.won, "winner_row_index"].astype(int).tolist()}
 
 
 def _spend_trajectory(winners: pd.DataFrame, curve: pd.DataFrame, budget: float, buckets: int) -> pd.DataFrame:
     if curve.empty: return pd.DataFrame(columns=["bucket", "cumulative_horizon_fraction", "cumulative_budget_fraction", "cumulative_spend_fraction", "cumulative_impression_fraction", "remaining_budget_fraction", "spend_smoothness"])
-    total, spend_total, wins_total = len(curve), float(curve.cumulative_spend.iat[-1]), max(int(winners.won.sum()), 1); rows: list[dict[str, Any]] = []
+    total, wins_total = len(curve), max(int(winners.won.sum()), 1); rows: list[dict[str, Any]] = []
     for bucket in range(1, buckets + 1):
         end = min(total, math.ceil(total * bucket / buckets)); at_end = curve.iloc[end - 1]; horizon = end / total; spend = float(at_end.cumulative_spend)
-        rows.append({"bucket": f"bucket_{bucket}", "cumulative_horizon_fraction": horizon, "cumulative_budget_fraction": horizon, "cumulative_spend_fraction": spend / spend_total if spend_total else 0.0, "cumulative_impression_fraction": int(winners.iloc[:end].won.sum()) / wins_total, "remaining_budget_fraction": max(budget - spend, 0.0) / budget if budget else None})
+        rows.append({"bucket": f"bucket_{bucket}", "cumulative_horizon_fraction": horizon, "cumulative_budget_fraction": horizon, "cumulative_spend_fraction": spend / budget if budget else None, "cumulative_impression_fraction": int(winners.iloc[:end].won.sum()) / wins_total, "remaining_budget_fraction": max(budget - spend, 0.0) / budget if budget else None})
     smoothness = float(np.mean([abs(row["cumulative_spend_fraction"] - row["cumulative_horizon_fraction"]) for row in rows]))
     for row in rows: row["spend_smoothness"] = smoothness
     return pd.DataFrame(rows)

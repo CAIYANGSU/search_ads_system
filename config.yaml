@@ -423,6 +423,8 @@ business_simulation:
     prediction_column: null
   pacing:
     enabled: true
+    alpha: 0.2
+    epsilon: 1.0e-12
     comparison_policies: [calibrated_ctcvr_scaled, target_cpa_bidding]
     trajectory_buckets: 10
   max_rows: null

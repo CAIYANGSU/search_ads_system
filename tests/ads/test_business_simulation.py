@@ -7,8 +7,8 @@ import yaml
 
 from search_ads_system.ads.auction import group_candidates, run_auction
 from search_ads_system.ads.bidding import synthetic_bid, target_cpa_bid, value_based_bid
-from search_ads_system.ads.pacing import pacing_multipliers
-from search_ads_system.ads.simulator import SimulationConfig, future_b_isolation_contract, simulate_attribution, simulate_search_conversion
+from search_ads_system.ads.pacing import feedback_pacing_multiplier, pacing_multipliers
+from search_ads_system.ads.simulator import SimulationConfig, _pacing_metrics, future_b_isolation_contract, simulate_attribution, simulate_search_conversion
 from pipeline.run_ads_business_simulation import _reject_future_b_path, main as business_main
 
 
@@ -34,6 +34,31 @@ def test_target_cpa_and_value_bid_monotonicity() -> None:
     assert target_cpa_bid(calibrated_pctcvr=np.array([.2]), target_cpa=1., bid_scale=1.).item() >= target_cpa_bid(calibrated_pctcvr=np.array([.1]), target_cpa=1., bid_scale=1.).item()
     assert value_based_bid(calibrated_pctcvr=np.array([.2]), predicted_conditional_conversion_value=np.array([10.]), target_roas=2., bid_scale=1.).item() >= value_based_bid(calibrated_pctcvr=np.array([.2]), predicted_conditional_conversion_value=np.array([5.]), target_roas=2., bid_scale=1.).item()
     assert value_based_bid(calibrated_pctcvr=np.array([.2]), predicted_conditional_conversion_value=np.array([10.]), target_roas=4., bid_scale=1.).item() <= value_based_bid(calibrated_pctcvr=np.array([.2]), predicted_conditional_conversion_value=np.array([10.]), target_roas=2., bid_scale=1.).item()
+
+
+def test_feedback_pacing_moves_in_the_correct_direction_and_respects_bounds() -> None:
+    ahead = feedback_pacing_multiplier(current_multiplier=1., elapsed_horizon_fraction=.2, cumulative_spend=.8, total_budget=1., minimum=.5, maximum=2., alpha=.2)
+    behind = feedback_pacing_multiplier(current_multiplier=1., elapsed_horizon_fraction=.2, cumulative_spend=.1, total_budget=1., minimum=.5, maximum=2., alpha=.2)
+    assert ahead < 1. < behind
+    assert feedback_pacing_multiplier(current_multiplier=2., elapsed_horizon_fraction=.01, cumulative_spend=1., total_budget=1., minimum=.5, maximum=2., alpha=1.) == .5
+    assert feedback_pacing_multiplier(current_multiplier=.5, elapsed_horizon_fraction=1., cumulative_spend=0., total_budget=1., minimum=.5, maximum=2., alpha=1.) == 2.
+
+
+def test_budget_exhaustion_uses_cumulative_spend_over_configured_budget() -> None:
+    winners = pd.DataFrame({"won": [True] * 20, "winner_row_index": list(range(20))})
+    early_curve = pd.DataFrame({"cumulative_spend": [.5, 1.] + [1.] * 18})
+    late_curve = pd.DataFrame({"cumulative_spend": list(np.linspace(.01, .98, 18)) + [.99, 1.]})
+    early = _pacing_metrics(winners, early_curve, budget=1., buckets=10)
+    late = _pacing_metrics(winners, late_curve, budget=1., buckets=10)
+    assert early["budget_exhaustion_horizon_fraction"] == .1 and early["early_budget_exhaustion"] is True
+    assert late["budget_exhaustion_horizon_fraction"] == .95 and late["early_budget_exhaustion"] is False
+
+
+def test_feedback_pacing_requires_no_labels() -> None:
+    candidates = pd.DataFrame({"synthetic_auction_id": [0, 0, 1, 1], "quality": [.2, .1, .3, .2], "bid": [1., .5, 1., .5]})
+    winners, curve = run_auction(candidates, quality_column="quality", bid_column="bid", mechanism="second_price", budget=1., feedback_pacing={"minimum": .5, "maximum": 2., "alpha": .2})
+    assert len(winners) == len(curve) == 2
+    assert curve.pacing_multiplier.between(.5, 2.).all()
 
 
 def test_raw_calibrated_and_search_value_paths_stay_independent() -> None:

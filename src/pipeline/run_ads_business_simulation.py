@@ -111,7 +111,7 @@ def main() -> None:
         seed=int(options.get("seed", 2026)), candidates_per_auction=int(options.get("candidates_per_auction", 5)), base_bid=float(options.get("base_bid", 1.0)), mechanism=str(options.get("mechanism", "second_price")), total_budget=float(options.get("total_budget", 1000.0)), pacing_min=float(options.get("pacing_min", .5)), pacing_max=float(options.get("pacing_max", 2.0)), budget_levels=tuple(float(value) for value in options.get("budget_levels", (.25, .5, .75, 1.0))),
         target_cpa_enabled=bool(target_cpa.get("enabled", True)), target_cpa_values=tuple(float(value) for value in target_cpa.get("target_cpa_values", (.5, 1., 2.))), default_target_cpa=float(target_cpa.get("default_target_cpa", 1.)), target_cpa_bid_scale=float(target_cpa.get("bid_scale", 1.)),
         value_based_enabled=bool(value_bidding.get("enabled", True)), target_roas_values=tuple(float(value) for value in value_bidding.get("target_roas_values", (1., 2., 4.))), default_target_roas=float(value_bidding.get("default_target_roas", 2.)), value_based_bid_scale=float(value_bidding.get("bid_scale", 1.)), value_prediction_column=value_bidding.get("prediction_column"),
-        pacing_enabled=bool(pacing.get("enabled", True)), pacing_comparison_policies=tuple(str(value) for value in pacing.get("comparison_policies", ("calibrated_ctcvr_scaled", "target_cpa_bidding"))), trajectory_buckets=int(pacing.get("trajectory_buckets", 10)),
+        pacing_enabled=bool(pacing.get("enabled", True)), pacing_alpha=float(pacing.get("alpha", .2)), pacing_epsilon=float(pacing.get("epsilon", 1e-12)), pacing_comparison_policies=tuple(str(value) for value in pacing.get("comparison_policies", ("calibrated_ctcvr_scaled", "target_cpa_bidding"))), trajectory_buckets=int(pacing.get("trajectory_buckets", 10)),
     )
     limit = options.get("max_rows"); limit = None if limit is None else int(limit)
     attribution, calibrated = _load_attribution(raw, config_path, args.stage, limit)
@@ -165,7 +165,18 @@ def _conclusion(attribution: Mapping[str, Any]) -> list[str]:
         conclusion.append(f"Value-based bidding is unavailable: {value['reason']}")
     pacing = attribution["pacing_comparison"]
     if pacing.get("available"):
-        conclusion.append("No-pacing and budget-aware pacing use identical deterministic auction order, seed, predictions, and budgets; results are reported rather than optimized.")
+        delayed = smoother = cpa_changed = compared = 0
+        for levels in pacing["policies"].values():
+            for modes in levels.values():
+                no_pacing, aware = modes.get("no_pacing"), modes.get("budget_aware_pacing")
+                if not no_pacing or not aware:
+                    continue
+                compared += 1
+                no_exhaustion, aware_exhaustion = no_pacing.get("budget_exhaustion_horizon_fraction"), aware.get("budget_exhaustion_horizon_fraction")
+                if aware_exhaustion is not None and (no_exhaustion is None or aware_exhaustion > no_exhaustion): delayed += 1
+                if aware.get("spend_smoothness") is not None and no_pacing.get("spend_smoothness") is not None and aware["spend_smoothness"] < no_pacing["spend_smoothness"]: smoother += 1
+                if aware.get("cpa_proxy") != no_pacing.get("cpa_proxy"): cpa_changed += 1
+        conclusion.append(f"Across {compared} matched pacing comparisons, budget-aware pacing delayed budget exhaustion in {delayed}, improved spend smoothness in {smoother}, and changed CPA proxy in {cpa_changed}; pacing is evaluated for delivery, not model quality.")
     return conclusion
 
 
