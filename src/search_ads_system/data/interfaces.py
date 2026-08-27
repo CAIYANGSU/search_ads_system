@@ -69,6 +69,19 @@ class PreprocessConfig:
         return self.outputs.schema_report
 
 
+@dataclass(frozen=True)
+class AttributionPreprocessConfig:
+    """Independent ingestion and strict-time split contract for Criteo Attribution."""
+
+    dataset: DelimitedDatasetConfig
+    processed_data: Path
+    temporal_output_dir: Path
+    audit_path: Path
+    build_metadata_path: Path
+    past_ratio: float
+    future_a_ratio: float
+
+
 def parse_preprocess_config(raw_config: dict[str, Any], config_path: Path) -> PreprocessConfig:
     """Parse and validate the data-pipeline portion of a YAML configuration."""
 
@@ -124,6 +137,64 @@ def parse_preprocess_config(raw_config: dict[str, Any], config_path: Path) -> Pr
     _validate_output_paths(parsed.outputs)
     if parsed.eda.top_k <= 0:
         raise ValueError("preprocessing.eda.top_k must be greater than zero")
+    return parsed
+
+
+def parse_attribution_preprocess_config(
+    raw_config: dict[str, Any], config_path: Path
+) -> AttributionPreprocessConfig:
+    """Parse the Attribution-only data contract without touching Search data."""
+
+    try:
+        attribution = raw_config["attribution_preprocessing"]
+        dataset = attribution["dataset"]
+        paths = raw_config["paths"]
+    except KeyError as error:
+        raise ValueError("Configuration must define paths and attribution_preprocessing.dataset") from error
+
+    config_directory = config_path.parent.resolve()
+    missing_values = dataset.get("missing_value_tokens", {})
+    by_column = {
+        str(column): tuple(str(token) for token in tokens)
+        for column, tokens in missing_values.get("by_column", {}).items()
+    }
+    parsed_dataset = DelimitedDatasetConfig(
+        path=resolve_path(str(dataset["path"]), config_directory),
+        delimiter=str(dataset.get("delimiter", "\t")),
+        has_header=bool(dataset.get("has_header", True)),
+        encoding=str(dataset.get("encoding", "utf-8")),
+        chunk_size=int(dataset.get("chunk_size", 200_000)),
+        column_names=tuple(str(name) for name in dataset.get("column_names", [])),
+        label_columns=tuple(str(name) for name in dataset.get("label_columns", ["click", "conversion"])),
+        missing_value_tokens=tuple(str(token) for token in missing_values.get("default", ["", "-1"])),
+        missing_value_tokens_by_column=by_column,
+    )
+    _validate_dataset_config(parsed_dataset)
+
+    output_root = resolve_path(str(paths["outputs_dir"]), config_directory).resolve()
+    parsed = AttributionPreprocessConfig(
+        dataset=parsed_dataset,
+        processed_data=resolve_path(str(attribution["processed_data"]), config_directory),
+        temporal_output_dir=resolve_path(str(attribution["temporal_output_dir"]), config_directory),
+        audit_path=resolve_path(str(attribution["audit_path"]), config_directory),
+        build_metadata_path=resolve_path(str(attribution["build_metadata_path"]), config_directory),
+        past_ratio=float(attribution.get("split", {}).get("past_ratio", 0.8)),
+        future_a_ratio=float(attribution.get("split", {}).get("future_a_ratio", 0.5)),
+    )
+    for name, path in {
+        "processed_data": parsed.processed_data,
+        "temporal_output_dir": parsed.temporal_output_dir,
+        "audit_path": parsed.audit_path,
+        "build_metadata_path": parsed.build_metadata_path,
+    }.items():
+        try:
+            path.resolve().relative_to(output_root)
+        except ValueError as error:
+            raise ValueError(f"attribution_preprocessing.{name} must be within paths.outputs_dir: {path}") from error
+    if not 0.0 < parsed.past_ratio < 1.0:
+        raise ValueError("attribution_preprocessing.split.past_ratio must be between zero and one")
+    if not 0.0 < parsed.future_a_ratio < 1.0:
+        raise ValueError("attribution_preprocessing.split.future_a_ratio must be between zero and one")
     return parsed
 
 

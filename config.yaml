@@ -72,6 +72,50 @@ preprocessing:
       - user_id
     missing_category_token: __MISSING__
 
+# Independent display-impression contract. This intentionally has no linkage to
+# the clicked-only Search Conversion pipeline or its temporal/recall artifacts.
+attribution_preprocessing:
+  dataset:
+    path: criteo_attribution/criteo_attribution_dataset.tsv
+    delimiter: "\t"
+    has_header: true
+    encoding: utf-8
+    chunk_size: 200000
+    column_names:
+      - timestamp
+      - uid
+      - campaign
+      - conversion
+      - conversion_timestamp
+      - conversion_id
+      - attribution
+      - click
+      - click_pos
+      - click_nb
+      - cost
+      - cpo
+      - time_since_last_click
+      - cat1
+      - cat2
+      - cat3
+      - cat4
+      - cat5
+      - cat6
+      - cat7
+      - cat8
+      - cat9
+    label_columns: [click, conversion]
+    missing_value_tokens:
+      default: ["", "-1"]
+  processed_data: outputs/processed/criteo_attribution_impression
+  temporal_output_dir: outputs/attribution_temporal
+  build_metadata_path: outputs/metrics/attribution_impression_build_metadata.json
+  audit_path: outputs/metrics/attribution_impression_data_audit.json
+  split:
+    # Future-A/Future-B are equal timestamp-contiguous subwindows of Future.
+    past_ratio: 0.8
+    future_a_ratio: 0.5
+
 training:
   batch_size: 512
   learning_rate: 0.001

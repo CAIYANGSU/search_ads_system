@@ -33,6 +33,18 @@ CriteoSearchData (TSV, raw)
 
 所有 pipeline 产物均由 `config.yaml` 的 `paths` 管理，并且必须位于 `paths.outputs_dir`（默认 `outputs/`）下。原始数据不会被修改。CSV 按分块写入，避免将约 6GB 的源文件一次性读入内存。
 
+## Attribution impression 数据契约
+
+Search Conversion 与 Criteo Attribution 严格隔离：前者是 clicked-only 商品广告交互，后者是 display impression。Attribution 专属 pipeline 以流式方式生成 `outputs/processed/criteo_attribution_impression/`，随后按严格 timestamp 切分为 `outputs/attribution_temporal/split/past/`、`future_a/` 与 `future_b/`。它保留 raw `click`、`conversion`，并只派生 `click_and_conversion = click AND conversion`；不会伪造 exposure negative、不会 join Search Conversion、也不会训练模型。
+
+```bash
+# build | split | audit | all; all stages are model-free
+PYTHONPATH=src python src/pipeline/run_attribution_preprocess.py --config config.yaml --stage all
+```
+
+`audit` 会生成 `outputs/metrics/attribution_impression_data_audit.json` 和 `.md`，并强制验证：
+`max(Past timestamp) < min(Future-A timestamp) < min(Future-B timestamp)`。默认 ESMM 输入仅是 impression-time 字段；conversion/touchpoint outcome、`cpo` 和其他 leakage-risk 字段不会进入安全特征集。
+
 ## 商品广告统一 Schema
 
 每一行代表一次商品广告点击后的转化观测。由于原始数据没有 click ID，转换阶段基于原始行号生成稳定的 `event_id`（例如 `criteo-000000000001`）。`-1`（及 `click_timestamp` 的 `0`）转换为空值。
