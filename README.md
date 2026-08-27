@@ -137,6 +137,10 @@ Past/full feature SQLite index。`fine_rank.mode: temporal` 会强制使用
 `outputs/temporal/` 下的 temporal coarse candidates、Past features、Future-A
 training labels 与 Future-B validation labels，避免覆盖 full-data 产物。
 
+推理不会把 coarse candidates 回填为训练标签。它会一次预加载可容纳的 feature
+index，随后按 CSV chunk 做向量化 feature join、hash/tensor preparation、GPU batch
+scoring 和按用户 Top-K 写出；日志每百万行报告读入、特征、GPU、排序和写出耗时。
+
 ## 开发与验证
 
 ```bash

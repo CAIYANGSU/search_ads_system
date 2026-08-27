@@ -30,7 +30,7 @@ from search_ads_system.ranking.dcnv2 import DCNv2MultiTask
 from search_ads_system.ranking.fine_rank_dataset import (
     DEFAULT_BUCKET_SIZES, DENSE_FEATURES, SPARSE_FEATURES, FineRankDatasetSpec,
     FineRankFeatureStore, FineRankParquetDataset, build_or_reuse_cached_datasets,
-    encode_feature_frame,
+    encode_feature_frame, SparseHashCache,
 )
 from search_ads_system.ranking.fine_rank_metrics import evaluate_fine_rank_predictions
 
@@ -56,6 +56,8 @@ class FineRankConfig:
     num_cross_layers: int = 3
     batch_size: int = 8192
     inference_batch_size: int = 32_768
+    inference_progress_rows: int = 1_000_000
+    feature_index_memory_limit_gb: float = 8.0
     epochs: int = 5
     learning_rate: float = 0.001
     weight_decay: float = 0.00001
@@ -121,7 +123,7 @@ def parse_fine_rank_config(raw_config: Mapping[str, Any], config_path: Path) -> 
         feature_source_path=feature_source, train_label_path=train_labels, validation_label_path=validation_labels, metrics_path=metrics_path,
         top_k=int(options.get("top_k", 20)), max_train_rows=int(options.get("max_train_rows", 3_000_000)), chunk_size=int(options.get("chunk_size", 200_000)),
         embedding_dim=int(options.get("embedding_dim", 32)), hidden_dims=tuple(int(value) for value in options.get("hidden_dims", (256, 128, 64))), num_cross_layers=int(options.get("num_cross_layers", 3)),
-        batch_size=int(options.get("batch_size", 8192)), inference_batch_size=int(options.get("inference_batch_size", options.get("batch_size", 8192) * 4)), epochs=int(options.get("epochs", 5)),
+        batch_size=int(options.get("batch_size", 8192)), inference_batch_size=int(options.get("inference_batch_size", options.get("batch_size", 8192) * 4)), inference_progress_rows=int(options.get("inference_progress_rows", 1_000_000)), feature_index_memory_limit_gb=float(options.get("feature_index_memory_limit_gb", 8.0)), epochs=int(options.get("epochs", 5)),
         learning_rate=float(options.get("learning_rate", 0.001)), weight_decay=float(options.get("weight_decay", 0.00001)), value_loss_weight=float(options.get("value_loss_weight", 0.2)), value_log_clip_max=float(options.get("value_log_clip_max", 20.0)), gradient_clip_norm=float(options.get("gradient_clip_norm", 5.0)),
         num_workers=int(options.get("num_workers", min(12, max(1, os.cpu_count() or 1)))), prefetch_factor=int(options.get("prefetch_factor", 4)), pin_memory=bool(options.get("pin_memory", True)), persistent_workers=bool(options.get("persistent_workers", True)),
         amp=bool(options.get("amp", True)), device=str(options.get("device", "auto")), train=bool(options.get("train", True)), early_stopping=bool(early.get("enabled", True)), patience=int(early.get("patience", 2)), validation_fraction=float(options.get("validation_fraction", 0.1)), random_seed=seed, oom_retries=int(options.get("oom_retries", 3)), bucket_sizes=bucket_sizes,
@@ -260,31 +262,83 @@ def infer_fine_rank(config: FineRankConfig) -> dict[str, Any]:
     if not config.model_path.is_file():
         raise FileNotFoundError(f"Fine-rank checkpoint not found: {config.model_path}")
     if not dataset_spec(config).index_path.is_file():
-        build_dataset(config)
-    device = resolve_device(config.device); model, checkpoint = load_fine_ranker(config, device); store = FineRankFeatureStore(dataset_spec(config).index_path)
+        raise FileNotFoundError(f"Fine-rank feature index not found: {dataset_spec(config).index_path}. Build the dataset cache once before inference.")
+    device = resolve_device(config.device); model, checkpoint = load_fine_ranker(config, device)
     transform = _value_transform(checkpoint.get("dataset_metadata", {}))
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = config.output_path.with_suffix(config.output_path.suffix + ".tmp")
     started = time.perf_counter(); written = 0; processed = 0; batches = 0; diagnostics = _PredictionDiagnostics()
+    timings = {"feature_index_load_seconds": 0.0, "candidate_read_seconds": 0.0, "feature_preparation_seconds": 0.0, "gpu_scoring_seconds": 0.0, "ranking_seconds": 0.0, "write_seconds": 0.0}
+    next_progress = config.inference_progress_rows
     try:
         with temporary.open("w", newline="", encoding="utf-8") as file:
-            writer = csv.writer(file); writer.writerow(("user_id", "candidate_ad_id", "pCVR", "predicted_conversion_value", "expected_value_score", "rank"))
-            pending: list[tuple[str, pd.DataFrame]] = []; pending_rows = 0
-            for user, group in _iter_candidate_groups(config.input_path, config.chunk_size):
-                pending.append((user, group)); pending_rows += len(group)
-                if pending_rows >= config.inference_batch_size:
-                    written += _score_pending(pending, model, store, config, device, writer, transform, diagnostics); processed += pending_rows; batches += 1; pending = []; pending_rows = 0
-            if pending:
-                written += _score_pending(pending, model, store, config, device, writer, transform, diagnostics); processed += pending_rows; batches += 1
+            file.write("user_id,candidate_ad_id,pCVR,predicted_conversion_value,expected_value_score,rank\n"); file.flush()
+            # The file exists before the potentially expensive one-time index
+            # preload so operational monitoring can distinguish startup from a hang.
+            index_started = time.perf_counter()
+            store = FineRankFeatureStore(dataset_spec(config).index_path, memory_limit_bytes=int(config.feature_index_memory_limit_gb * 2**30))
+            timings["feature_index_load_seconds"] = time.perf_counter() - index_started
+            hash_cache = SparseHashCache(config.bucket_sizes, config.random_seed)
+            try:
+                frames = iter(_iter_candidate_frames(config.input_path, config.chunk_size))
+                while True:
+                    read_started = time.perf_counter()
+                    try:
+                        frame = next(frames)
+                    except StopIteration:
+                        break
+                    timings["candidate_read_seconds"] += time.perf_counter() - read_started
+                    rows, output_rows, batch_timings = _score_candidate_frame(frame, model, store, config, device, transform, diagnostics, hash_cache, file)
+                    processed += rows; written += output_rows; batches += 1
+                    for name, value in batch_timings.items(): timings[name] += value
+                    if processed >= next_progress:
+                        elapsed = time.perf_counter() - started
+                        LOGGER.info("Fine-rank inference progress processed_rows=%s rows_per_second=%.1f elapsed_seconds=%.1f index_load_seconds=%.1f candidate_read_seconds=%.1f feature_seconds=%.1f gpu_scoring_seconds=%.1f ranking_seconds=%.1f write_seconds=%.1f lookup_mode=%s", processed, processed / elapsed if elapsed else 0.0, elapsed, timings["feature_index_load_seconds"], timings["candidate_read_seconds"], timings["feature_preparation_seconds"], timings["gpu_scoring_seconds"], timings["ranking_seconds"], timings["write_seconds"], store.lookup_mode)
+                        next_progress += config.inference_progress_rows
+            finally:
+                store.close()
         temporary.replace(config.output_path)
     finally:
-        store.close()
         if temporary.exists():
             temporary.unlink()
     elapsed = time.perf_counter() - started
-    metrics = {"output_rows": written, "input_candidates": processed, "elapsed_seconds": elapsed, "candidates_per_second": processed / elapsed if elapsed else 0.0, "batches_per_second": batches / elapsed if elapsed else 0.0, "device": str(device), "batch_size": config.inference_batch_size, "prediction_diagnostics": diagnostics.summary()}
+    slowest_stage = max(timings, key=timings.get)
+    metrics = {"output_rows": written, "input_candidates": processed, "elapsed_seconds": elapsed, "candidates_per_second": processed / elapsed if elapsed else 0.0, "batches_per_second": batches / elapsed if elapsed else 0.0, "device": str(device), "batch_size": config.inference_batch_size, "feature_lookup_mode": store.lookup_mode if 'store' in locals() else None, "timings": timings, "slowest_stage": slowest_stage, "prediction_diagnostics": diagnostics.summary()}
     LOGGER.info("Fine-rank inference wrote %s rows (%.1f candidates/s) to %s", written, metrics["candidates_per_second"], config.output_path)
     return metrics
+
+
+def benchmark_fine_rank_inference_preprocessing(config: FineRankConfig, *, max_rows: int = 100_000) -> dict[str, Any]:
+    """Measure the vectorized candidate feature path without training or writing.
+
+    This is intentionally a preprocessing benchmark: it identifies whether the
+    CPU join/tensor-preparation path can keep a GPU fed before a full run.
+    """
+    if max_rows <= 0:
+        raise ValueError("max_rows must be positive")
+    index_path = dataset_spec(config).index_path
+    if not index_path.is_file():
+        raise FileNotFoundError(f"Fine-rank feature index not found: {index_path}")
+    started = time.perf_counter(); rows = 0; hash_cache = SparseHashCache(config.bucket_sizes, config.random_seed)
+    store = FineRankFeatureStore(index_path, memory_limit_bytes=int(config.feature_index_memory_limit_gb * 2**30))
+    try:
+        for frame in _iter_candidate_frames(config.input_path, config.chunk_size):
+            frame = frame.iloc[: max_rows - rows]
+            if frame.empty:
+                break
+            encoded = encode_feature_frame(store.enrich(frame), bucket_sizes=config.bucket_sizes, random_seed=config.random_seed, hash_cache=hash_cache)
+            # Materialize exactly the arrays inference sends to Torch.
+            encoded[[f"dense__{name}" for name in DENSE_FEATURES]].to_numpy(dtype=np.float32, copy=False)
+            encoded[[f"sparse__{name}" for name in SPARSE_FEATURES]].to_numpy(dtype=np.int64, copy=False)
+            rows += len(encoded)
+            if rows >= max_rows:
+                break
+    finally:
+        mode = store.lookup_mode; store.close()
+    elapsed = time.perf_counter() - started
+    result = {"rows": rows, "elapsed_seconds": elapsed, "rows_per_second": rows / elapsed if elapsed else 0.0, "lookup_mode": mode}
+    LOGGER.info("Fine-rank preprocessing benchmark rows=%s rows_per_second=%.1f lookup_mode=%s", rows, result["rows_per_second"], mode)
+    return result
 
 
 def run_fine_rank(config: FineRankConfig, *, stage: str = "all") -> dict[str, Any]:
@@ -317,44 +371,55 @@ def resolve_device(option: str) -> torch.device:
     return requested
 
 
-def _score_pending(groups: list[tuple[str, pd.DataFrame]], model: DCNv2MultiTask, store: FineRankFeatureStore, config: FineRankConfig, device: torch.device, writer: csv.writer, value_transform: Mapping[str, float], diagnostics: "_PredictionDiagnostics") -> int:
-    frame = pd.concat([group for _, group in groups], ignore_index=True)
-    encoded = encode_feature_frame(store.enrich(frame), bucket_sizes=config.bucket_sizes, random_seed=config.random_seed)
-    dense = torch.as_tensor(encoded[[f"dense__{name}" for name in DENSE_FEATURES]].to_numpy(dtype=np.float32), device=device)
-    sparse = torch.as_tensor(encoded[[f"sparse__{name}" for name in SPARSE_FEATURES]].to_numpy(dtype=np.int64), device=device)
-    model.eval()
+def _score_candidate_frame(frame: pd.DataFrame, model: DCNv2MultiTask, store: FineRankFeatureStore, config: FineRankConfig, device: torch.device, value_transform: Mapping[str, float], diagnostics: "_PredictionDiagnostics", hash_cache: SparseHashCache, file: Any) -> tuple[int, int, dict[str, float]]:
+    timings = {"feature_preparation_seconds": 0.0, "gpu_scoring_seconds": 0.0, "ranking_seconds": 0.0, "write_seconds": 0.0}
+    started = time.perf_counter()
+    encoded = encode_feature_frame(store.enrich(frame), bucket_sizes=config.bucket_sizes, random_seed=config.random_seed, hash_cache=hash_cache)
+    timings["feature_preparation_seconds"] = time.perf_counter() - started
+    dense_values = encoded[[f"dense__{name}" for name in DENSE_FEATURES]].to_numpy(dtype=np.float32, copy=False)
+    sparse_values = encoded[[f"sparse__{name}" for name in SPARSE_FEATURES]].to_numpy(dtype=np.int64, copy=False)
+    probabilities: list[np.ndarray] = []; values: list[np.ndarray] = []; expected_values: list[np.ndarray] = []
+    started = time.perf_counter(); model.eval()
     with torch.no_grad(), torch.amp.autocast(device_type=device.type, enabled=config.amp and device.type == "cuda"):
-        probability, predicted_log_value, value, expected = model.predict_with_log(dense, sparse, **_prediction_kwargs(value_transform))
-    diagnostics.update(predicted_log_value.cpu().numpy(), value.cpu().numpy())
-    encoded["pCVR"] = probability.cpu().numpy(); encoded["predicted_conversion_value"] = value.cpu().numpy(); encoded["expected_value_score"] = expected.cpu().numpy()
-    offset = 0; written = 0
-    for user, group in groups:
-        scored = encoded.iloc[offset : offset + len(group)].copy(); offset += len(group)
-        scored = scored.sort_values(["expected_value_score", "pCVR", "candidate_ad_id"], ascending=[False, False, True], kind="mergesort").iloc[: config.top_k]
-        for rank, row in enumerate(scored.itertuples(index=False), start=1):
-            writer.writerow((user, row.candidate_ad_id, float(row.pCVR), float(row.predicted_conversion_value), float(row.expected_value_score), rank)); written += 1
-    return written
+        for offset in range(0, len(encoded), config.inference_batch_size):
+            dense = torch.as_tensor(dense_values[offset : offset + config.inference_batch_size], device=device)
+            sparse = torch.as_tensor(sparse_values[offset : offset + config.inference_batch_size], device=device)
+            probability, predicted_log_value, value, expected = model.predict_with_log(dense, sparse, **_prediction_kwargs(value_transform))
+            diagnostics.update(predicted_log_value.cpu().numpy(), value.cpu().numpy())
+            probabilities.append(probability.cpu().numpy()); values.append(value.cpu().numpy()); expected_values.append(expected.cpu().numpy())
+    if device.type == "cuda": torch.cuda.synchronize(device)
+    timings["gpu_scoring_seconds"] = time.perf_counter() - started
+    encoded["pCVR"] = np.concatenate(probabilities); encoded["predicted_conversion_value"] = np.concatenate(values); encoded["expected_value_score"] = np.concatenate(expected_values)
+    started = time.perf_counter()
+    ranked = encoded.sort_values(["user_id", "expected_value_score", "pCVR", "candidate_ad_id"], ascending=[True, False, False, True], kind="mergesort")
+    ranked["rank"] = ranked.groupby("user_id", sort=False).cumcount() + 1
+    output = ranked.loc[ranked["rank"] <= config.top_k, ["user_id", "candidate_ad_id", "pCVR", "predicted_conversion_value", "expected_value_score", "rank"]]
+    timings["ranking_seconds"] = time.perf_counter() - started
+    started = time.perf_counter(); output.to_csv(file, header=False, index=False); timings["write_seconds"] = time.perf_counter() - started
+    return len(encoded), len(output), timings
 
 
-def _iter_candidate_groups(path: Path, chunk_size: int) -> Iterator[tuple[str, pd.DataFrame]]:
-    current: str | None = None; rows: list[dict[str, Any]] = []; completed: set[str] = set()
+def _iter_candidate_frames(path: Path, chunk_size: int) -> Iterator[pd.DataFrame]:
+    """Yield complete user groups without candidate-level Python iteration."""
+    carry = pd.DataFrame()
     for chunk in pd.read_csv(path, chunksize=chunk_size, low_memory=False):
         required = {"user_id", "candidate_ad_id"}
         if not required.issubset(chunk):
             raise ValueError(f"Fine-rank input missing columns: {sorted(required - set(chunk))}")
-        for row in chunk.to_dict("records"):
-            user = str(row["user_id"]).strip(); candidate = str(row["candidate_ad_id"]).strip()
-            if not user or not candidate or user.lower() == "nan" or candidate.lower() == "nan":
-                continue
-            if current is not None and user != current:
-                if current in completed:
-                    raise ValueError("Fine-rank input must keep each user's candidate rows contiguous")
-                completed.add(current); yield current, pd.DataFrame(rows); rows = []
-            current = user; row["user_id"] = user; row["candidate_ad_id"] = candidate; rows.append(row)
-    if current is not None:
-        if current in completed:
-            raise ValueError("Fine-rank input must keep each user's candidate rows contiguous")
-        yield current, pd.DataFrame(rows)
+        chunk = chunk.dropna(subset=["user_id", "candidate_ad_id"]).copy()
+        chunk["user_id"] = chunk["user_id"].astype("string").str.strip(); chunk["candidate_ad_id"] = chunk["candidate_ad_id"].astype("string").str.strip()
+        chunk = chunk.loc[chunk["user_id"].ne("") & chunk["candidate_ad_id"].ne("")].copy()
+        frame = pd.concat((carry, chunk), ignore_index=True, copy=False) if not carry.empty else chunk
+        if len(frame) < 2:
+            carry = frame; continue
+        starts = np.flatnonzero(frame["user_id"].to_numpy()[1:] != frame["user_id"].to_numpy()[:-1]) + 1
+        if not len(starts):
+            carry = frame; continue
+        split = int(starts[-1])
+        yield frame.iloc[:split].copy()
+        carry = frame.iloc[split:].copy()
+    if not carry.empty:
+        yield carry
 
 
 def _load_cache_metadata(config: FineRankConfig) -> dict[str, Any]:
@@ -448,8 +513,8 @@ def _log_device_config(config: FineRankConfig, device: torch.device) -> None:
 
 
 def _validate_config(config: FineRankConfig) -> None:
-    positive = (config.top_k, config.max_train_rows, config.chunk_size, config.embedding_dim, config.num_cross_layers, config.batch_size, config.inference_batch_size, config.epochs, config.num_workers, config.prefetch_factor)
-    if any(value <= 0 for value in positive) or not 0 <= config.value_loss_weight or not 0 < config.validation_fraction < 1 or config.patience <= 0 or not np.isfinite(config.value_log_clip_max) or config.value_log_clip_max <= 0 or not np.isfinite(config.gradient_clip_norm) or config.gradient_clip_norm <= 0:
+    positive = (config.top_k, config.max_train_rows, config.chunk_size, config.embedding_dim, config.num_cross_layers, config.batch_size, config.inference_batch_size, config.inference_progress_rows, config.epochs, config.num_workers, config.prefetch_factor)
+    if any(value <= 0 for value in positive) or not 0 <= config.value_loss_weight or not 0 < config.validation_fraction < 1 or config.patience <= 0 or not np.isfinite(config.value_log_clip_max) or config.value_log_clip_max <= 0 or not np.isfinite(config.gradient_clip_norm) or config.gradient_clip_norm <= 0 or not np.isfinite(config.feature_index_memory_limit_gb) or config.feature_index_memory_limit_gb < 0:
         raise ValueError("Fine-rank numeric configuration contains an invalid value")
     if len(config.bucket_sizes) != len(SPARSE_FEATURES) or any(value <= 1 for value in config.bucket_sizes):
         raise ValueError("fine_rank hash bucket configuration is invalid")

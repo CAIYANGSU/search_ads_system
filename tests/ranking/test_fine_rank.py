@@ -13,6 +13,7 @@ import torch
 from search_ads_system.ranking.dcnv2 import DCNv2MultiTask
 from search_ads_system.ranking.fine_rank import (
     FineRankConfig,
+    benchmark_fine_rank_inference_preprocessing,
     build_dataset,
     build_model,
     dataset_spec,
@@ -156,9 +157,20 @@ def test_checkpoint_train_false_style_load_and_chunked_topk_inference(tmp_path: 
     assert output["output_rows"] == len(ranked)
     assert output["prediction_diagnostics"]["nonfinite_values"] == 0
     assert set(output["prediction_diagnostics"]["predicted_log_value"]) == {"min", "median", "p95", "p99", "max"}
+    assert output["timings"]["feature_preparation_seconds"] >= 0 and output["slowest_stage"] in output["timings"]
     assert ranked.groupby("user_id").size().eq(2).all()
     assert ranked.groupby("user_id")["rank"].apply(lambda ranks: ranks.tolist() == [1, 2]).all()
     assert np.allclose(ranked.expected_value_score, ranked.pCVR * ranked.predicted_conversion_value)
+
+
+def test_vectorized_100k_candidate_preprocessing_benchmark(tmp_path: Path) -> None:
+    config = FineRankConfig(**{**_config(tmp_path).__dict__, "chunk_size": 10_000})
+    build_dataset(config)
+    users = np.repeat([f"u{index}" for index in range(2_000)], 50)
+    pd.DataFrame({"user_id": users, "candidate_ad_id": np.resize(np.asarray(["a1", "a2", "a3", "a4", "missing"]), len(users)), "coarse_score": .5, "rank": np.tile(np.arange(1, 51), 2_000)}).to_csv(config.input_path, index=False)
+    benchmark = benchmark_fine_rank_inference_preprocessing(config)
+    assert benchmark["rows"] == 100_000
+    assert benchmark["rows_per_second"] > 1_000
 
 
 def test_cpu_amp_and_cuda_unavailable_fallback() -> None:

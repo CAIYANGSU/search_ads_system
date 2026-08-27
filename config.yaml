@@ -198,6 +198,10 @@ fine_rank:
   num_cross_layers: 3
   batch_size: 8192
   inference_batch_size: 32768
+  # Candidate CSV is read in chunk_size-sized vectorized frames.  The feature
+  # SQLite index is preloaded once when its on-disk size is within this limit.
+  feature_index_memory_limit_gb: 8.0
+  inference_progress_rows: 1000000
   epochs: 1
   learning_rate: 0.0005
   weight_decay: 0.00001

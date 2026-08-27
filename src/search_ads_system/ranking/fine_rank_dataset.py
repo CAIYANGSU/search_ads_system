@@ -51,6 +51,30 @@ USER_COLUMNS = ("clicks_last_7d", "device_type", "click_timestamp")
 MAX_DENSE_ABS_VALUE = 10.0
 
 
+class SparseHashCache:
+    """Caches stable hashes by sparse field across inference batches."""
+
+    def __init__(self, bucket_sizes: Sequence[int], random_seed: int) -> None:
+        self.bucket_sizes = tuple(int(value) for value in bucket_sizes)
+        self.random_seed = random_seed
+        self._values: list[dict[str, int]] = [dict() for _ in SPARSE_FEATURES]
+
+    def encode(self, values: pd.Series, index: int) -> np.ndarray:
+        normalized = _normalise_id_series(values).fillna("__MISSING__")
+        codes, unique = pd.factorize(normalized, sort=False)
+        cache = self._values[index]
+        bucket = self.bucket_sizes[index]
+        encoded_unique = np.empty(len(unique), dtype=np.int64)
+        for position, value in enumerate(unique):
+            text = str(value)
+            hashed = cache.get(text)
+            if hashed is None:
+                hashed = stable_hash(text, bucket, self.random_seed + index)
+                cache[text] = hashed
+            encoded_unique[position] = hashed
+        return encoded_unique[codes]
+
+
 def assert_no_fine_rank_leakage(feature_columns: Sequence[str]) -> None:
     leaked = set(feature_columns) & LEAKAGE_COLUMNS
     if leaked:
@@ -98,41 +122,59 @@ class FineRankDatasetSpec:
 
 
 class FineRankFeatureStore:
-    """Persistent, bounded-query SQLite lookup for Past/full product and user features."""
+    """Vectorized product/user feature lookup for fine-rank inference.
 
-    def __init__(self, path: Path) -> None:
+    The initial implementation assigned SQLite results into a DataFrame cell by
+    cell, which makes tens of millions of candidates effectively single-core.
+    This store preloads a reasonably sized index once, otherwise uses bounded
+    SQLite queries followed by vectorized pandas merges.
+    """
+
+    def __init__(self, path: Path, *, memory_limit_bytes: int = 0) -> None:
         self.path = path
         self.connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        self.products: pd.DataFrame | None = None
+        self.users: pd.DataFrame | None = None
+        self.lookup_mode = "sqlite_vectorized"
+        if memory_limit_bytes and path.stat().st_size <= memory_limit_bytes:
+            self._preload()
 
     def close(self) -> None:
         self.connection.close()
 
     def enrich(self, candidates: pd.DataFrame) -> pd.DataFrame:
         frame = candidates.copy()
-        frame["user_id"] = frame["user_id"].map(_normalise_id)
-        frame["candidate_ad_id"] = frame["candidate_ad_id"].map(_normalise_id)
-        product_map = self._lookup("products", "product_id", frame["candidate_ad_id"].dropna().unique().tolist(), PRODUCT_COLUMNS)
-        user_map = self._lookup("users", "user_id", frame["user_id"].dropna().unique().tolist(), USER_COLUMNS)
-        for index, candidate_id in frame["candidate_ad_id"].items():
-            values = product_map.get(candidate_id, ())
-            for offset, column in enumerate(PRODUCT_COLUMNS):
-                frame.loc[index, column] = values[offset] if values else None
-        for index, user_id in frame["user_id"].items():
-            values = user_map.get(user_id, ())
-            for offset, column in enumerate(USER_COLUMNS):
-                frame.loc[index, column] = values[offset] if values else None
-        return frame
+        frame["user_id"] = _normalise_id_series(frame["user_id"])
+        frame["candidate_ad_id"] = _normalise_id_series(frame["candidate_ad_id"])
+        frame = frame.drop(columns=["product_id", *PRODUCT_COLUMNS, *USER_COLUMNS], errors="ignore")
+        if self.products is not None and self.users is not None:
+            return frame.merge(self.products, how="left", left_on="candidate_ad_id", right_on="product_id", sort=False).drop(columns="product_id", errors="ignore").merge(self.users, how="left", on="user_id", sort=False)
+        products = self._lookup_frame("products", "product_id", frame["candidate_ad_id"].dropna().unique(), PRODUCT_COLUMNS)
+        users = self._lookup_frame("users", "user_id", frame["user_id"].dropna().unique(), USER_COLUMNS)
+        return frame.merge(products, how="left", left_on="candidate_ad_id", right_on="product_id", sort=False).drop(columns="product_id", errors="ignore").merge(users, how="left", on="user_id", sort=False)
 
-    def _lookup(self, table: str, key: str, values: list[str], columns: Sequence[str]) -> dict[str, tuple[Any, ...]]:
-        result: dict[str, tuple[Any, ...]] = {}
+    def _preload(self) -> None:
+        products = pd.read_sql_query(f"SELECT product_id, {', '.join(PRODUCT_COLUMNS)} FROM products", self.connection)
+        users = pd.read_sql_query(f"SELECT user_id, {', '.join(USER_COLUMNS)} FROM users", self.connection)
+        products["product_id"] = _normalise_id_series(products["product_id"])
+        users["user_id"] = _normalise_id_series(users["user_id"])
+        self.products = products
+        self.users = users
+        self.lookup_mode = "in_memory_vectorized"
+        LOGGER.info("Preloaded fine-rank feature index into memory: products=%s users=%s index_bytes=%s", len(products), len(users), self.path.stat().st_size)
+
+    def _lookup_frame(self, table: str, key: str, values: Sequence[object], columns: Sequence[str]) -> pd.DataFrame:
+        query_values = [str(value) for value in values if value is not None and not pd.isna(value)]
+        rows: list[pd.DataFrame] = []
         for start in range(0, len(values), 900):
-            subset = values[start : start + 900]
+            subset = query_values[start : start + 900]
             if not subset:
                 continue
             marks = ",".join("?" for _ in subset)
-            query = f"SELECT {key}, {', '.join(columns)} FROM {table} WHERE {key} IN ({marks})"
-            for row in self.connection.execute(query, subset):
-                result[str(row[0])] = tuple(row[1:])
+            rows.append(pd.read_sql_query(f"SELECT {key}, {', '.join(columns)} FROM {table} WHERE {key} IN ({marks})", self.connection, params=subset))
+        result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=(key, *columns))
+        if not result.empty:
+            result[key] = _normalise_id_series(result[key])
         return result
 
 
@@ -361,7 +403,7 @@ def _shortfall_reason(maximum: int, train_rows: int, diagnostics: Mapping[str, A
     return f"only {available} observed click interactions were assigned to train after required-field and validation split filters; no coarse-candidate overlap filter is applied"
 
 
-def encode_feature_frame(frame: pd.DataFrame, *, bucket_sizes: Sequence[int] = DEFAULT_BUCKET_SIZES, random_seed: int = 2026) -> pd.DataFrame:
+def encode_feature_frame(frame: pd.DataFrame, *, bucket_sizes: Sequence[int] = DEFAULT_BUCKET_SIZES, random_seed: int = 2026, hash_cache: SparseHashCache | None = None) -> pd.DataFrame:
     """Encode safe model features; labels are preserved solely as training targets."""
     assert_no_fine_rank_leakage(DENSE_FEATURES + SPARSE_FEATURES)
     output = pd.DataFrame(index=frame.index)
@@ -386,7 +428,7 @@ def encode_feature_frame(frame: pd.DataFrame, *, bucket_sizes: Sequence[int] = D
         output[f"dense__{name}"] = np.clip(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0), -MAX_DENSE_ABS_VALUE, MAX_DENSE_ABS_VALUE).astype(np.float32)
     for index, (name, bucket) in enumerate(zip(SPARSE_FEATURES, bucket_sizes)):
         source = output["candidate_ad_id"] if name == "product_id" else output["user_id"] if name == "user_id" else frame.get(name, pd.Series(None, index=frame.index))
-        output[f"sparse__{name}"] = [stable_hash(value, int(bucket), random_seed + index) for value in source]
+        output[f"sparse__{name}"] = hash_cache.encode(source, index) if hash_cache is not None else _hash_series(source, int(bucket), random_seed + index)
     label = pd.to_numeric(frame.get("conversion_label", pd.Series(0.0, index=frame.index)), errors="coerce").fillna(0).astype(np.float32)
     value = pd.to_numeric(frame.get("conversion_value_eur", pd.Series(np.nan, index=frame.index)), errors="coerce").astype(np.float64)
     finite_nonnegative_value = np.isfinite(value) & (value >= 0)
@@ -533,11 +575,24 @@ def _bounded_signed_log(values: np.ndarray) -> np.ndarray:
     return np.clip(np.sign(safe) * np.log1p(np.abs(safe)), -MAX_DENSE_ABS_VALUE, MAX_DENSE_ABS_VALUE)
 
 
+def _hash_series(values: pd.Series, bucket_size: int, seed: int) -> np.ndarray:
+    normalized = _normalise_id_series(values).fillna("__MISSING__")
+    codes, unique = pd.factorize(normalized, sort=False)
+    hashed = np.fromiter((stable_hash(value, bucket_size, seed) for value in unique), dtype=np.int64, count=len(unique))
+    return hashed[codes]
+
+
 def _normalise_id(value: object) -> str | None:
     if value is None or pd.isna(value):
         return None
     text = str(value).strip()
     return text or None
+
+
+def _normalise_id_series(values: pd.Series) -> pd.Series:
+    """Fast vectorized ID normalization used by inference joins."""
+    result = values.astype("string").str.strip()
+    return result.mask(result.isin(("", "nan", "None", "<NA>")), pd.NA)
 
 
 def _finite_or_none(value: object) -> float | None:
