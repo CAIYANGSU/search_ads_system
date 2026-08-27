@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from search_ads_system.recall.rrf_fusion import RRFFusionConfig, fuse_and_write_candidates, fuse_recall_candidates
+from search_ads_system.recall.rrf_fusion import RRFFusionConfig, fuse_and_write_candidates, fuse_recall_candidates, rank_rrf_candidates
 
 
 def _config(tmp_path: Path, top_k_per_user: int = 200, max_users: int = 500_000) -> RRFFusionConfig:
@@ -79,3 +79,23 @@ def test_rrf_limits_fusion_to_max_users(tmp_path: Path, caplog) -> None:
     written = pd.read_csv(config.output_path)
     assert written["user_id"].unique().tolist() == ["u1"]
     assert "Selected users=1/2" in caplog.text
+
+
+def test_rrf_ranker_deduplicates_within_source_and_breaks_ties_by_candidate() -> None:
+    ranked = rank_rrf_candidates(
+        {"itemcf": [("b", 1), ("b", 2), ("a", 1)], "two_tower": [], "popularity": []},
+        k=0, weights={"itemcf": 1.0, "two_tower": 1.0, "popularity": 1.0}, top_k=2,
+    )
+    assert [candidate for candidate, _, _ in ranked] == ["a", "b"]
+    assert ranked[1][1] == pytest.approx(1.0)
+
+
+def test_rrf_protected_quota_is_bounded_and_deduplicated() -> None:
+    ranked = rank_rrf_candidates(
+        {"itemcf": [("shared", 1), ("i", 2)], "two_tower": [("t", 1)], "popularity": [("shared", 1), ("p", 2)]},
+        k=60, weights={"itemcf": 3.0, "two_tower": 3.0, "popularity": 1.0}, top_k=2,
+        min_quotas={"popularity": 2},
+    )
+    assert len(ranked) == 2
+    assert [candidate for candidate, _, _ in ranked] == ["shared", "p"]
+    assert len({candidate for candidate, _, _ in ranked}) == 2

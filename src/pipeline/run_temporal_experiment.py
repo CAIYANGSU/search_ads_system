@@ -8,6 +8,7 @@ from search_ads_system.evaluation.temporal import build_temporal_split, diagnose
 from search_ads_system.recall.itemcf_recall import ItemCFRecallConfig, generate_itemcf_candidates, load_interactions as load_itemcf, write_candidates as write_itemcf
 from search_ads_system.recall.popularity_recall import PopularityRecallConfig, generate_popularity_candidates, write_candidates as write_popularity
 from search_ads_system.recall.rrf_fusion import RRFFusionConfig, fuse_and_write_candidates
+from search_ads_system.recall.temporal_fusion import run_temporal_fusion_sweep
 from search_ads_system.recall.two_tower_recall import TwoTowerRecallConfig, run_two_tower_recall
 
 def _recall(raw, temporal):
@@ -44,8 +45,21 @@ def _evaluate(raw, temporal):
     import pandas as pd; pd.DataFrame(rows).to_csv(target/'recall_metrics.csv',index=False)
     return metrics
 
+def _fusion_sweep(raw, temporal):
+    """Future-A-only fusion development; does not train or overwrite recall."""
+    root=temporal.output_dir; candidates=root/'recall_candidates'; options=raw.get('temporal',{}).get('recall',{}).get('fusion_sweep',{})
+    future_a=root/'split'/'future_a'
+    if not future_a.exists():
+        from search_ads_system.evaluation.temporal import build_future_ab_split
+        build_future_ab_split(temporal)
+    return run_temporal_fusion_sweep(
+        itemcf_path=candidates/'itemcf_topk.csv', two_tower_path=candidates/'two_tower_topk.csv', popularity_path=candidates/'popularity_topk.csv',
+        future_a_path=future_a, output_dir=root/'metrics', chunk_size=temporal.chunk_size,
+        top_k=int(options.get('top_k',100)), popularity_quota=int(options.get('popularity_min_quota',25)), balanced_quota=int(options.get('balanced_min_quota',20)),
+    )
+
 def main()->None:
-    parser=argparse.ArgumentParser(); parser.add_argument("--config",type=Path,default=ROOT/"config.yaml"); parser.add_argument("--stage",choices=("split","itemcf","two_tower","popularity","rrf","evaluate_recall","coarse","all"),default="all"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument("--config",type=Path,default=ROOT/"config.yaml"); parser.add_argument("--stage",choices=("split","itemcf","two_tower","popularity","rrf","evaluate_recall","fusion_sweep","coarse","all"),default="all"); args=parser.parse_args()
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     path=args.config.resolve(); raw=load_yaml_config(path); temporal=parse_temporal_config(raw,path); result={}
     if args.stage in ('split','all'): result['split']=build_temporal_split(temporal)
@@ -54,6 +68,8 @@ def main()->None:
         _recall(raw,temporal); result['recall']='complete'
     if args.stage in ('evaluate_recall','all'):
         result['recall_metrics']=_evaluate(raw,temporal)
+    if args.stage == 'fusion_sweep':
+        result['fusion_sweep']=_fusion_sweep(raw,temporal)
     if args.stage in ('coarse','all'):
         result['coarse_metrics']=run_temporal_coarse(temporal,max_train_rows=int(raw.get('temporal',{}).get('coarse_rank',{}).get('max_train_rows',2_000_000)),top_k=int(raw.get('temporal',{}).get('coarse_rank',{}).get('top_k',50)))
         target=temporal.output_dir/'metrics'; summary={'split':result.get('split',json.loads((temporal.output_dir/'split'/'metadata.json').read_text())),'pipeline':temporal_pipeline_diagnostics(temporal),'recall':result.get('recall_metrics',{}),'coarse':result['coarse_metrics'],'leakage':{'passed':True}}

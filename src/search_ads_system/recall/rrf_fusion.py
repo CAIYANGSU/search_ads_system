@@ -280,29 +280,76 @@ def _fuse_one_user(
     popularity: list[tuple[str, int]],
     config: RRFFusionConfig,
 ) -> list[tuple[str, str, float, int]]:
+    ranked = rank_rrf_candidates(
+        {**source_candidates, "popularity": popularity},
+        k=config.k,
+        weights=config.weights or {},
+        top_k=config.top_k_per_user,
+    )
+    return [(user_id, candidate_id, score, int(mask).bit_count()) for candidate_id, score, mask in ranked]
+
+
+def rank_rrf_candidates(
+    source_candidates: Mapping[str, list[tuple[str, int]]],
+    *,
+    k: int,
+    weights: Mapping[str, float],
+    top_k: int,
+    min_quotas: Mapping[str, int] | None = None,
+) -> list[tuple[str, float, int]]:
+    """Fuse one user's ranked source lists without writing an artifact.
+
+    The production fusion uses this with no quotas.  Temporal diagnostics can
+    optionally reserve positions from individual source lists before the
+    deterministic RRF fill.  A quota is a *source-candidate* quota, not a
+    label-aware rule: Future labels never participate in this function.
+    """
+    if k < 0 or top_k <= 0:
+        raise ValueError("k must be non-negative and top_k must be positive")
+    if set(weights) != set(_SOURCE_BITS):
+        raise ValueError("weights must define itemcf, two_tower, and popularity")
+    quotas = dict(min_quotas or {})
+    if set(quotas) - set(_SOURCE_BITS) or any(int(value) < 0 for value in quotas.values()):
+        raise ValueError("min_quotas must contain non-negative known source values")
+
     scores: dict[str, list[float | int]] = {}
-    for candidate_id, rank in popularity:
-        _add_rrf_score(scores, candidate_id, "popularity", rank, config)
     for source, candidates in source_candidates.items():
         for candidate_id, rank in candidates:
-            _add_rrf_score(scores, candidate_id, source, rank, config)
+            score, source_mask = scores.get(candidate_id, [0.0, 0])
+            bit = _SOURCE_BITS[source]
+            # A duplicated item within one input source receives its first
+            # rank once; duplicates never inflate RRF score.
+            if not int(source_mask) & bit:
+                scores[candidate_id] = [
+                    float(score) + float(weights[source]) / (k + rank),
+                    int(source_mask) | bit,
+                ]
     ranked = sorted(
         ((candidate_id, float(score), int(mask).bit_count()) for candidate_id, (score, mask) in scores.items()),
         key=lambda row: (-row[1], row[0]),
-    )[: config.top_k_per_user]
-    return [(user_id, candidate_id, score, source_count) for candidate_id, score, source_count in ranked]
+    )
+    if not any(quotas.values()):
+        return [(candidate_id, score, int(scores[candidate_id][1])) for candidate_id, score, _ in ranked[:top_k]]
 
-
-def _add_rrf_score(
-    scores: dict[str, list[float | int]], candidate_id: str, source: str, rank: int, config: RRFFusionConfig
-) -> None:
-    score, source_mask = scores.get(candidate_id, [0.0, 0])
-    bit = _SOURCE_BITS[source]
-    if not int(source_mask) & bit:
-        scores[candidate_id] = [
-            float(score) + config.weight_for(source) / (config.k + rank),
-            int(source_mask) | bit,
-        ]
+    # Reserve source-list positions first.  Per-source rank then ID supplies a
+    # stable order; RRF remains the only ordering rule for the remaining slots.
+    selected: list[str] = []
+    selected_set: set[str] = set()
+    for source in _SOURCE_BITS:
+        quota = int(quotas.get(source, 0))
+        for candidate_id, _ in sorted(source_candidates.get(source, []), key=lambda item: (item[1], item[0])):
+            if len(selected) >= top_k or sum(1 for candidate in selected if int(scores[candidate][1]) & _SOURCE_BITS[source]) >= quota:
+                break
+            if candidate_id not in selected_set:
+                selected.append(candidate_id)
+                selected_set.add(candidate_id)
+    for candidate_id, _, _ in ranked:
+        if len(selected) >= top_k:
+            break
+        if candidate_id not in selected_set:
+            selected.append(candidate_id)
+            selected_set.add(candidate_id)
+    return [(candidate_id, float(scores[candidate_id][0]), int(scores[candidate_id][1])) for candidate_id in selected]
 
 
 def _normalise_id(value: object) -> str | None:

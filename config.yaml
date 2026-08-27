@@ -302,6 +302,12 @@ temporal:
     two_tower_top_k: 100
     popularity_top_k: 200
     rrf_top_k: 100
+    # Independent, Future-A-only fusion development. This does not overwrite
+    # fused_candidates.csv or formal production RRF parameters.
+    fusion_sweep:
+      top_k: 100
+      popularity_min_quota: 25
+      balanced_min_quota: 20
   coarse_rank:
     max_train_rows: 1000000
     top_k: 50
