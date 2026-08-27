@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
@@ -115,8 +116,8 @@ def feature_contract() -> dict[str, Any]:
 class ClickInteractionDataset(IterableDataset[dict[str, Tensor]]):
     """Chunked CSV reader which never creates pseudo impression negatives."""
 
-    def __init__(self, path: Path, config: FineRankMultiTaskConfig, *, max_rows: int | None) -> None:
-        self.path, self.config, self.max_rows = path, config, max_rows
+    def __init__(self, path: Path, config: FineRankMultiTaskConfig, *, max_rows: int | None, include_identifiers: bool = False) -> None:
+        self.path, self.config, self.max_rows, self.include_identifiers = path, config, max_rows, include_identifiers
 
     def __iter__(self) -> Iterator[dict[str, Tensor]]:
         info = get_worker_info()
@@ -163,7 +164,10 @@ class ClickInteractionDataset(IterableDataset[dict[str, Tensor]]):
                 log_values = np.nan_to_num(encoded.log_conversion_value.to_numpy(np.float32), nan=0.0)
                 values = np.nan_to_num(encoded.conversion_value_eur.to_numpy(np.float32), nan=0.0)
                 for index in range(len(encoded)):
-                    yield {"dense": torch.from_numpy(dense[index]), "sparse": torch.from_numpy(sparse[index]), "label": torch.tensor(labels[index]), "log_value": torch.tensor(log_values[index]), "value_mask": torch.tensor(masks[index]), "observed_value": torch.tensor(values[index])}
+                    row: dict[str, Any] = {"dense": torch.from_numpy(dense[index]), "sparse": torch.from_numpy(sparse[index]), "label": torch.tensor(labels[index]), "log_value": torch.tensor(log_values[index]), "value_mask": torch.tensor(masks[index]), "observed_value": torch.tensor(values[index])}
+                    if self.include_identifiers:
+                        row.update(user_id=str(encoded.user_id.iat[index]), product_id=str(encoded.candidate_ad_id.iat[index]))
+                    yield row
 
 
 def multitask_loss(logits: Tensor, predicted_log_value: Tensor, labels: Tensor, log_values: Tensor, value_mask: Tensor, *, lambda_cvr: float, lambda_value: float) -> tuple[Tensor, Tensor, Tensor]:
@@ -363,6 +367,10 @@ def _device(requested: str) -> torch.device:
 
 
 def _seed(seed: int) -> None:
+    # Required by CUDA for deterministic GEMM kernels when deterministic
+    # algorithms are requested. Set before any CUDA work rather than disabling
+    # reproducibility to silence CuBLAS warnings.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(True, warn_only=True)

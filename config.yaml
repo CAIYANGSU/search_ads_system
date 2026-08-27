@@ -359,6 +359,22 @@ fine_rank_multitask:
     embedding_dim: 16
     hidden_dims: [64, 32]
     num_workers: 0
+  # Independent credibility audit. It opens only Past and Future-A; Future-B
+  # is path-checked but never read.
+  audit:
+    output_dir: outputs/fine_rank/audit
+    epochs: 3
+    batch_size: 8192
+    patience: 2
+    max_train_rows: null
+    max_validation_rows: null
+    max_diagnostic_rows: 1000000
+    sanity:
+      max_train_rows: 200000
+      max_validation_rows: 100000
+      max_diagnostic_rows: 100000
+      epochs: 1
+      batch_size: 4096
 
 ranking:
   model: deepfm
