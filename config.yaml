@@ -331,6 +331,35 @@ fine_rank:
     patience: 2
   train: true
 
+# Independent Search Conversion clicked-interaction multi-task fine rank.
+# Past trains and Future-A selects; Future-B is intentionally never opened by
+# this pipeline for model selection.
+fine_rank_multitask:
+  batch_size: 8192
+  epochs: 3
+  learning_rate: 0.0005
+  weight_decay: 0.00001
+  amp: true
+  patience: 2
+  lambda_cvr: 1.0
+  lambda_value: 0.2
+  embedding_dim: 32
+  hidden_dims: [256, 128, 64]
+  cross_layers: 3
+  chunk_size: 200000
+  num_workers: 4
+  device: auto
+  model_dir: outputs/fine_rank/models
+  metrics_dir: outputs/fine_rank/metrics
+  sanity:
+    max_train_rows: 200000
+    max_validation_rows: 100000
+    epochs: 1
+    batch_size: 4096
+    embedding_dim: 16
+    hidden_dims: [64, 32]
+    num_workers: 0
+
 ranking:
   model: deepfm
   hidden_dims: [256, 128]

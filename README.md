@@ -60,6 +60,30 @@ PYTHONPATH=src python src/pipeline/run_attribution_preprocess.py --config config
 
 完整字段定义在 `src/search_ads_system/data/unified_schema.py` 的 `UNIFIED_COLUMNS`。转换会校验 `Sale` 是二元标签，避免将异常标签带入后续商品广告排序建模步骤。
 
+## Search Conversion conversion-only Fine Rank
+
+`run_fine_rank_multitask.py` is an isolated clicked-interaction experiment. It
+trains on temporal `Past`, selects DeepFM/DCNv2 on `Future-A`, and does not
+read `Future-B` for model selection. Its two outputs are:
+
+- `pCVR_clicked = P(conversion | clicked interaction)`
+- `E[conversion_value_eur | conversion=1, clicked interaction]`
+
+Their product is **expected conversion value per clicked interaction**. It is
+not CTR, eCPM, impression-level value, ROI, revenue per impression, or auction
+value. DIN is reported unavailable unless the source provides a validated user
+history sequence; the pipeline never fabricates one.
+
+```bash
+PYTHONPATH=src python src/pipeline/run_fine_rank_multitask.py --config config.yaml --stage sanity
+PYTHONPATH=src python src/pipeline/run_fine_rank_multitask.py --config config.yaml --stage all
+```
+
+Metrics and selected-model checkpoints are written below
+`outputs/fine_rank/`. The sanity mode limits inputs to Past 200k / Future-A
+100k rows and performs actual forward, backward, value-loss, and Future-A
+evaluation.
+
 ## 安装
 
 ```bash
