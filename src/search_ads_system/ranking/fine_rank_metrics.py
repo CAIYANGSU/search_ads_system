@@ -11,7 +11,7 @@ import numpy as np
 from sklearn.metrics import average_precision_score, log_loss, mean_absolute_error, mean_squared_error, roc_auc_score
 
 
-def evaluate_fine_rank_predictions(rows: Iterable[dict[str, Any]], *, cutoffs: tuple[int, ...] = (10, 20)) -> dict[str, Any]:
+def evaluate_fine_rank_predictions(rows: Iterable[dict[str, Any]], *, cutoffs: tuple[int, ...] = (10, 20), allow_observed_click_ranking: bool = True) -> dict[str, Any]:
     """Calculate prediction and per-user ranking metrics from streamed batches.
 
     Each element is expected to contain 1-D arrays plus user/candidate lists.
@@ -77,7 +77,15 @@ def evaluate_fine_rank_predictions(rows: Iterable[dict[str, Any]], *, cutoffs: t
         "positive_rate": float(np.mean(y)) if len(y) else None,
     }
     value_metrics = _value_metrics(observed[value_mask], predicted[value_mask])
-    result = {"pcvr": cvr, "pcvr_distribution": {"conversion_label_1": _distribution(p[y == 1]), "conversion_label_0": _distribution(p[y == 0])}, "calibration": _calibration(y, p), "value": value_metrics, "ranking": {f"ndcg@{k}": _divide(ndcg[k], users_with_conversion) for k in cutoffs} | {f"recall@{k}": _divide(recall[k], users_with_conversion) for k in cutoffs} | {f"hit_rate@{k}": _divide(hit[k], users_with_conversion) for k in cutoffs}, "expected_value_comparison": _finalize_comparison(comparison), "users_with_conversion": users_with_conversion, "rows": int(len(y))}
+    ranking: dict[str, Any]
+    expected_value_comparison: dict[str, Any]
+    if allow_observed_click_ranking:
+        ranking = {"available": True, "population": "observed clicked interactions"} | {f"ndcg@{k}": _divide(ndcg[k], users_with_conversion) for k in cutoffs} | {f"recall@{k}": _divide(recall[k], users_with_conversion) for k in cutoffs} | {f"hit_rate@{k}": _divide(hit[k], users_with_conversion) for k in cutoffs}
+        expected_value_comparison = _finalize_comparison(comparison)
+    else:
+        ranking = {"available": False, "reason": "Temporal validation contains observed clicks, not a request-time candidate set with reliable unobserved negatives. Click-conditioned CVR classification is the primary metric."}
+        expected_value_comparison = {"available": False, "reason": ranking["reason"]}
+    result = {"pcvr": cvr, "pcvr_distribution": {"conversion_label_1": _distribution(p[y == 1]), "conversion_label_0": _distribution(p[y == 0])}, "calibration": _calibration(y, p), "value": value_metrics, "ranking": ranking, "expected_value_comparison": expected_value_comparison, "users_with_conversion": users_with_conversion, "rows": int(len(y))}
     return result
 
 

@@ -151,11 +151,20 @@ Temporal cache 会在构建前强制验证 `Past < Future-A < Future-B`。Future
 Temporal evaluation 输出 ROC-AUC、PR-AUC、LogLoss、Brier、positive rate、正负样本
 pCVR 分布和 20-bin calibration/ECE。其 audit 会写出 full vs temporal 对比，其中
 temporal 是最终泛化指标，full 仅是 IID/offline upper-bound reference。
+第二阶段 temporal audit 还会输出四个 seen/unseen user-product slice、每用户 observed
+click 行数分布、Past-only global/product/brand-category CVR priors、无 raw-ID 的
+Future-A Logistic Regression baseline，以及 value-head 的 constant-train baseline 和
+尾部分布。observed clicks 不是候选集；因此 temporal 的 Top-K/Hit/Recall 被明确标为
+不可用，主指标为 click-conditioned CVR classification。加入 `--with-id-ablation` 可在
+小样本上运行紧凑 bucket/embedding 的 A/B/C/D ID 消融和 1/3/5 epoch early-stopping
+sweep，临时模型不会覆盖 checkpoint。
 
 ```bash
 # Small independent temporal sanity run: creates Past/Future-A/Future-B,
 # trains/evaluates an isolated bounded checkpoint and writes its audit; no inference.
+# It uses fine_rank_dcnv2_sanity.pt and never overwrites the formal temporal checkpoint.
 PYTHONPATH=src python src/pipeline/run_fine_rank.py --config config.yaml --stage temporal_sanity
+PYTHONPATH=src python src/pipeline/run_fine_rank.py --config config.yaml --temporal --stage audit --with-id-ablation
 ```
 
 正式 temporal run 时，使用 `--temporal` 再依次运行下列阶段；它们只读写

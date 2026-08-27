@@ -12,7 +12,7 @@ import logging
 import sqlite3
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -20,7 +20,8 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
-from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score, log_loss, mean_absolute_error, mean_squared_error, roc_auc_score
 from torch import Tensor
 from torch.nn import functional as F
 from torch.optim import AdamW
@@ -31,7 +32,7 @@ from search_ads_system.ranking.fine_rank import (
     FineRankConfig, _loader, _prediction_kwargs, _to_device, _value_transform,
     build_model, dataset_spec, load_fine_ranker, resolve_device,
 )
-from search_ads_system.ranking.fine_rank_dataset import DENSE_FEATURES, LEAKAGE_COLUMNS, SPARSE_FEATURES, assert_no_fine_rank_leakage
+from search_ads_system.ranking.fine_rank_dataset import DENSE_FEATURES, LEAKAGE_COLUMNS, SPARSE_FEATURES, _iter_csv_chunks, assert_no_fine_rank_leakage
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +47,13 @@ class FineRankAuditConfig:
     ablation_validation_rows: int = 50_000
     ablation_epochs: int = 1
     ablation_batch_size: int = 8192
+    temporal_embedding_dim: int = 16
+    temporal_id_bucket_size: int = 65_537
+    temporal_hidden_dims: tuple[int, ...] = (64, 32)
+    temporal_experiment_train_rows: int = 100_000
+    temporal_experiment_validation_rows: int = 100_000
+    temporal_experiment_epochs: tuple[int, ...] = (1, 3, 5)
+    temporal_prior_smoothing: float = 20.0
     random_seed: int = 2026
 
 
@@ -76,9 +84,16 @@ def parse_fine_rank_audit_config(raw_config: Mapping[str, Any], config_path: Pat
         ablation_validation_rows=int(audit.get("ablation_validation_rows", 50_000)),
         ablation_epochs=int(audit.get("ablation_epochs", 1)),
         ablation_batch_size=int(audit.get("ablation_batch_size", 8192)),
+        temporal_embedding_dim=int(audit.get("temporal_embedding_dim", 16)),
+        temporal_id_bucket_size=int(audit.get("temporal_id_bucket_size", 65_537)),
+        temporal_hidden_dims=tuple(int(value) for value in audit.get("temporal_hidden_dims", (64, 32))),
+        temporal_experiment_train_rows=int(audit.get("temporal_experiment_train_rows", audit.get("ablation_train_rows", 100_000))),
+        temporal_experiment_validation_rows=int(audit.get("temporal_experiment_validation_rows", audit.get("ablation_validation_rows", 100_000))),
+        temporal_experiment_epochs=tuple(int(value) for value in audit.get("temporal_experiment_epochs", (1, 3, 5))),
+        temporal_prior_smoothing=float(audit.get("temporal_prior_smoothing", 20.0)),
         random_seed=int(audit.get("random_seed", fine_rank.random_seed)),
     )
-    if config.calibration_bins < 2 or config.output_chunk_size <= 0 or min(config.ablation_train_rows, config.ablation_validation_rows, config.ablation_epochs, config.ablation_batch_size) <= 0:
+    if config.calibration_bins < 2 or config.output_chunk_size <= 0 or min(config.ablation_train_rows, config.ablation_validation_rows, config.ablation_epochs, config.ablation_batch_size, config.temporal_embedding_dim, config.temporal_id_bucket_size, config.temporal_experiment_train_rows, config.temporal_experiment_validation_rows) <= 0 or not config.temporal_hidden_dims or any(value <= 0 for value in config.temporal_experiment_epochs) or not np.isfinite(config.temporal_prior_smoothing) or config.temporal_prior_smoothing < 0:
         raise ValueError("fine_rank.audit numeric configuration is invalid")
     if fine_rank.mode == "temporal" and "temporal" not in config.output_path.resolve().parts:
         raise ValueError("Temporal fine-rank audit output must be isolated below outputs/temporal")
@@ -117,7 +132,12 @@ def run_fine_rank_audit(config: FineRankConfig, audit_config: FineRankAuditConfi
             "split_audit": _split_audit(config),
             "fine_rank_output_diagnostics": _output_diagnostics(config.output_path, audit_config.output_chunk_size),
         }
-        if include_ablation:
+        if config.mode == "temporal":
+            report["temporal_second_stage"] = _temporal_second_stage_diagnostics(connection, config, audit_config, validation)
+        if include_ablation and config.mode == "temporal":
+            report["id_memorization_ablation"] = run_temporal_id_ablation(config, audit_config, report["classification_metrics"])
+            report["epoch_sweep"] = run_temporal_epoch_sweep(config, audit_config)
+        elif include_ablation:
             report["id_memorization_ablation"] = run_id_memorization_ablation(config, audit_config)
         else:
             report["id_memorization_ablation"] = {
@@ -130,8 +150,9 @@ def run_fine_rank_audit(config: FineRankConfig, audit_config: FineRankAuditConfi
         markdown_path = audit_config.output_path.with_suffix(".md")
         markdown_path.write_text(_render_markdown(report), encoding="utf-8")
         comparison_path = _write_full_vs_temporal_report(report, audit_config) if config.mode == "temporal" else None
+        temporal_diagnostic_path = _write_temporal_diagnostic_comparison(report, audit_config) if config.mode == "temporal" else None
         LOGGER.info("Fine-rank audit written to %s and %s", audit_config.output_path, markdown_path)
-        return {"report_path": str(audit_config.output_path), "markdown_path": str(markdown_path), "comparison_path": str(comparison_path) if comparison_path else None, "classification_metrics": report["classification_metrics"], "overlap": overlap, "ablation_ran": include_ablation}
+        return {"report_path": str(audit_config.output_path), "markdown_path": str(markdown_path), "comparison_path": str(comparison_path) if comparison_path else None, "temporal_diagnostic_comparison_path": str(temporal_diagnostic_path) if temporal_diagnostic_path else None, "classification_metrics": report["classification_metrics"], "overlap": overlap, "ablation_ran": include_ablation}
     finally:
         connection.close()
         database_path.unlink(missing_ok=True)
@@ -199,24 +220,30 @@ def _overlap_counts(connection: sqlite3.Connection, noun: str, column: str) -> d
 def _score_validation(model: torch.nn.Module, config: FineRankConfig, transform: Mapping[str, float], connection: sqlite3.Connection, bins: int) -> dict[str, Any]:
     device = resolve_device(config.device)
     loader = _loader(dataset_spec(config).validation_dir, config, batch_size=config.inference_batch_size, value_transform=transform, include_identifiers=True, force_workers=0)
-    labels: list[np.ndarray] = []; probabilities: list[np.ndarray] = []; row_id = 0
+    labels: list[np.ndarray] = []; probabilities: list[np.ndarray] = []; predicted_values: list[np.ndarray] = []; observed_values: list[np.ndarray] = []; value_masks: list[np.ndarray] = []; row_id = 0
     model.eval()
     with torch.no_grad():
         for batch in loader:
             dense, sparse, batch_labels, _, _ = _to_device(batch, device)
             with torch.amp.autocast(device_type=device.type, enabled=config.amp and device.type == "cuda"):
-                probability, _, _, _ = model.predict_with_log(dense, sparse, **_prediction_kwargs(transform))
+                probability, _, predicted_value, _ = model.predict_with_log(dense, sparse, **_prediction_kwargs(transform))
             y = batch_labels.detach().to(dtype=torch.int8).cpu().numpy()
             p = probability.detach().to(dtype=torch.float32).cpu().numpy()
             if not np.isfinite(p).all():
                 raise FloatingPointError("Fine-rank audit found non-finite validation pCVR")
             labels.append(y); probabilities.append(p)
+            predicted_values.append(predicted_value.detach().to(dtype=torch.float32).cpu().numpy())
+            observed_values.append(np.asarray(batch["observed_value"], dtype=np.float64))
+            value_masks.append(batch["value_mask"].detach().cpu().numpy())
             rows = [(row_id + index, str(user), str(product), int(label), float(score)) for index, (user, product, label, score) in enumerate(zip(batch["user_id"], batch["candidate_ad_id"], y, p))]
             connection.executemany("INSERT INTO validation_predictions VALUES (?, ?, ?, ?, ?)", rows)
             connection.commit(); row_id += len(rows)
     y = np.concatenate(labels) if labels else np.empty(0, dtype=np.int8)
     p = np.concatenate(probabilities) if probabilities else np.empty(0, dtype=np.float32)
-    return {"rows": int(len(y)), "prediction_distribution": {"conversion_label_1": _distribution(p[y == 1]), "conversion_label_0": _distribution(p[y == 0])}, "classification_metrics": _classification_metrics(y, p), "calibration": _calibration(y, p, bins)}
+    predicted = np.concatenate(predicted_values) if predicted_values else np.empty(0, dtype=np.float32)
+    observed = np.concatenate(observed_values) if observed_values else np.empty(0, dtype=np.float64)
+    mask = np.concatenate(value_masks).astype(bool) if value_masks else np.empty(0, dtype=bool)
+    return {"rows": int(len(y)), "prediction_distribution": {"conversion_label_1": _distribution(p[y == 1]), "conversion_label_0": _distribution(p[y == 0])}, "classification_metrics": _classification_metrics(y, p), "calibration": _calibration(y, p, bins), "value_head": _value_head_diagnostics(predicted, observed, mask, transform)}
 
 
 def _classification_metrics(labels: np.ndarray, probabilities: np.ndarray) -> dict[str, float | None]:
@@ -248,6 +275,32 @@ def _calibration(labels: np.ndarray, probabilities: np.ndarray, bins: int) -> di
     return {"bin_count": bins, "ece": float(ece), "bins": result}
 
 
+def _metrics_with_calibration(labels: np.ndarray, probabilities: np.ndarray, bins: int) -> dict[str, Any]:
+    metrics = _classification_metrics(labels, probabilities)
+    calibration = _calibration(labels, probabilities, bins)
+    return {**metrics, "ece": calibration["ece"], "calibration": calibration}
+
+
+def _value_head_diagnostics(predicted: np.ndarray, observed: np.ndarray, mask: np.ndarray, transform: Mapping[str, float]) -> dict[str, Any]:
+    predicted = np.asarray(predicted, dtype=np.float64); observed = np.asarray(observed, dtype=np.float64); valid = np.asarray(mask, dtype=bool) & np.isfinite(observed) & (observed >= 0)
+    train_log_mean = float(transform["mean"])
+    baseline_value = float(np.expm1(np.clip(train_log_mean, 0.0, float(transform["prediction_log_max"]))))
+    result: dict[str, Any] = {"predicted_conversion_value": _distribution(predicted), "valid_observed_value_rows": int(valid.sum()), "observed_conversion_value": _distribution(observed[valid]), "train_log_mean_constant_value_baseline": baseline_value}
+    if valid.any():
+        actual = observed[valid]; predicted_valid = np.maximum(predicted[valid], 0.0); baseline = np.full(len(actual), baseline_value)
+        result["model_metrics"] = _value_metrics(actual, predicted_valid)
+        result["constant_train_baseline_metrics"] = _value_metrics(actual, baseline)
+        result["expected_value_ranking_warning"] = "Use expected-value ranking cautiously when validation log-value error is large or predicted value tails greatly exceed observed tails; temporal CVR classification remains the primary reliable evaluation."
+    else:
+        result["model_metrics"] = {"mae": None, "rmse": None, "log_value_mae": None}
+        result["constant_train_baseline_metrics"] = result["model_metrics"]
+    return result
+
+
+def _value_metrics(actual: np.ndarray, predicted: np.ndarray) -> dict[str, float]:
+    return {"mae": float(mean_absolute_error(actual, predicted)), "rmse": float(np.sqrt(mean_squared_error(actual, predicted))), "log_value_mae": float(mean_absolute_error(np.log1p(actual), np.log1p(np.maximum(predicted, 0.0))))}
+
+
 def _strict_holdout_metrics(connection: sqlite3.Connection) -> dict[str, Any]:
     queries = {
         "unseen_user": "NOT EXISTS (SELECT 1 FROM train_users t WHERE t.user_id=p.user_id)",
@@ -259,6 +312,103 @@ def _strict_holdout_metrics(connection: sqlite3.Connection) -> dict[str, Any]:
         labels, probabilities = _prediction_query(connection, where)
         result[name] = {"rows": int(len(labels)), "metrics": _classification_metrics(labels, probabilities)}
     return result
+
+
+def _temporal_second_stage_diagnostics(connection: sqlite3.Connection, config: FineRankConfig, audit_config: FineRankAuditConfig, validation: Mapping[str, Any]) -> dict[str, Any]:
+    """Diagnostics that explain temporal cold-start coverage and weak ranking."""
+    return {
+        "primary_task": "click-conditioned CVR classification on observed clicks; no unobserved candidate is fabricated as a negative.",
+        "seen_unseen_slices": _seen_unseen_slices(connection, audit_config.calibration_bins),
+        "validation_candidate_count_distribution": _validation_candidate_count_distribution(connection),
+        "ranking_evaluation": {"available": False, "reason": "Observed-click validation is not a request-time candidate set with reliable candidate-level negatives. Report CVR classification as the temporal primary metric."},
+        "value_head": validation["value_head"],
+        "past_only_baselines": _past_only_baselines(connection, config, audit_config),
+    }
+
+
+def _seen_unseen_slices(connection: sqlite3.Connection, bins: int) -> dict[str, Any]:
+    combinations = {
+        "seen_user_seen_product": ("EXISTS (SELECT 1 FROM train_users u WHERE u.user_id=p.user_id)", "EXISTS (SELECT 1 FROM train_products i WHERE i.candidate_ad_id=p.candidate_ad_id)"),
+        "seen_user_unseen_product": ("EXISTS (SELECT 1 FROM train_users u WHERE u.user_id=p.user_id)", "NOT EXISTS (SELECT 1 FROM train_products i WHERE i.candidate_ad_id=p.candidate_ad_id)"),
+        "unseen_user_seen_product": ("NOT EXISTS (SELECT 1 FROM train_users u WHERE u.user_id=p.user_id)", "EXISTS (SELECT 1 FROM train_products i WHERE i.candidate_ad_id=p.candidate_ad_id)"),
+        "unseen_user_unseen_product": ("NOT EXISTS (SELECT 1 FROM train_users u WHERE u.user_id=p.user_id)", "NOT EXISTS (SELECT 1 FROM train_products i WHERE i.candidate_ad_id=p.candidate_ad_id)"),
+    }
+    result: dict[str, Any] = {}
+    for name, predicates in combinations.items():
+        labels, probabilities = _prediction_query(connection, " AND ".join(predicates))
+        result[name] = {"rows": int(len(labels)), **_metrics_with_calibration(labels, probabilities, bins)}
+    return result
+
+
+def _validation_candidate_count_distribution(connection: sqlite3.Connection) -> dict[str, Any]:
+    counts = np.asarray([row[0] for row in connection.execute("SELECT COUNT(*) FROM validation_predictions GROUP BY user_id")], dtype=np.int64)
+    if not len(counts):
+        return {"users": 0, "candidate_count": _distribution(counts), "users_with_at_least": {"2": 0, "5": 0, "10": 0}}
+    return {"users": int(len(counts)), "candidate_count": _distribution(counts), "users_with_at_least": {"2": int((counts >= 2).sum()), "5": int((counts >= 5).sum()), "10": int((counts >= 10).sum())}, "observed_click_only_warning": "Counts are observed click rows per user, not a candidate inventory; they cannot validate Top-K recall/hit-rate by themselves."}
+
+
+def _past_only_baselines(connection: sqlite3.Connection, config: FineRankConfig, audit_config: FineRankAuditConfig) -> dict[str, Any]:
+    """Past-label priors plus a Future-A logistic baseline with no raw IDs."""
+    priors = _build_past_priors(config.feature_source_path, config.chunk_size)
+    labels, products = _prediction_label_product_rows(connection)
+    global_rate = priors["global_positive_rate"]
+    product_scores = np.asarray([_smoothed_prior(priors["product"].get(product), global_rate, audit_config.temporal_prior_smoothing) for product in products], dtype=np.float32)
+    brand_category_scores = np.asarray([_brand_category_prior(product, priors, global_rate, audit_config.temporal_prior_smoothing) for product in products], dtype=np.float32)
+    result: dict[str, Any] = {
+        "semantics": "global/product/brand/category priors are calculated exclusively from Past conversion labels. Logistic regression uses Future-A supervision and Past-only cached features, never Future-B labels or statistics.",
+        "global_past_positive_rate": global_rate,
+        "global_positive_rate": _metrics_with_calibration(labels, np.full(len(labels), global_rate, dtype=np.float32), audit_config.calibration_bins),
+        "product_past_cvr_prior": _metrics_with_calibration(labels, product_scores, audit_config.calibration_bins),
+        "brand_category_past_cvr_prior": _metrics_with_calibration(labels, brand_category_scores, audit_config.calibration_bins),
+    }
+    logistic = _temporal_logistic_baseline(config, audit_config)
+    result["future_a_logistic_regression_no_raw_ids"] = logistic
+    return result
+
+
+def _build_past_priors(path: Path, chunk_size: int) -> dict[str, Any]:
+    product: dict[str, list[int]] = {}; brand: dict[str, list[int]] = {}; category: dict[str, list[int]] = {}; profile: dict[str, tuple[str | None, str | None]] = {}; positives = 0; rows = 0
+    for chunk in _iter_csv_chunks(path, chunk_size):
+        labels = pd.to_numeric(chunk.get("conversion_label"), errors="coerce")
+        for product_id, label, brand_id, category_id in zip(chunk.get("product_id", pd.Series(None, index=chunk.index)), labels, chunk.get("product_brand", pd.Series(None, index=chunk.index)), chunk.get("product_category_1", pd.Series(None, index=chunk.index))):
+            if label not in (0, 1):
+                continue
+            product_key = str(product_id).strip(); brand_key = _optional_key(brand_id); category_key = _optional_key(category_id)
+            if not product_key or product_key in {"nan", "None"}:
+                continue
+            rows += 1; positives += int(label); _update_counts(product, product_key, int(label)); profile[product_key] = (brand_key, category_key)
+            if brand_key is not None: _update_counts(brand, brand_key, int(label))
+            if category_key is not None: _update_counts(category, category_key, int(label))
+    if not rows:
+        raise ValueError("Temporal Past contains no valid conversion labels for baseline priors")
+    return {"global_positive_rate": positives / rows, "product": product, "brand": brand, "category": category, "profile": profile, "rows": rows}
+
+
+def _prediction_label_product_rows(connection: sqlite3.Connection) -> tuple[np.ndarray, list[str]]:
+    rows = connection.execute("SELECT label, candidate_ad_id FROM validation_predictions ORDER BY row_id").fetchall()
+    return np.asarray([row[0] for row in rows], dtype=np.int8), [str(row[1]) for row in rows]
+
+
+def _update_counts(table: dict[str, list[int]], key: str, label: int) -> None:
+    values = table.setdefault(key, [0, 0]); values[0] += int(label); values[1] += 1
+
+
+def _smoothed_prior(values: Sequence[int] | None, global_rate: float, smoothing: float) -> float:
+    if values is None:
+        return float(global_rate)
+    return float((values[0] + smoothing * global_rate) / (values[1] + smoothing))
+
+
+def _brand_category_prior(product: str, priors: Mapping[str, Any], global_rate: float, smoothing: float) -> float:
+    brand, category = priors["profile"].get(product, (None, None)); scores = [_smoothed_prior(priors["brand"].get(brand), global_rate, smoothing) if brand is not None else global_rate, _smoothed_prior(priors["category"].get(category), global_rate, smoothing) if category is not None else global_rate]
+    return float(np.mean(scores))
+
+
+def _optional_key(value: object) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    return text if text and text not in {"nan", "None", "<NA>"} else None
 
 
 def _prediction_query(connection: sqlite3.Connection, where: str) -> tuple[np.ndarray, np.ndarray]:
@@ -353,9 +503,8 @@ def _output_diagnostics(path: Path, chunk_size: int) -> dict[str, Any]:
 
 def run_id_memorization_ablation(config: FineRankConfig, audit_config: FineRankAuditConfig) -> dict[str, Any]:
     """Train four small temporary CVR-only models; production weights stay untouched."""
-    transform = _value_transform(json.loads(dataset_spec(config).metadata_path.read_text(encoding="utf-8")))
-    train = _sample_encoded_rows(dataset_spec(config).cache_dir, audit_config.ablation_train_rows, transform)
-    validation = _sample_encoded_rows(dataset_spec(config).validation_dir, audit_config.ablation_validation_rows, transform)
+    train = _sample_encoded_rows(dataset_spec(config).cache_dir, audit_config.ablation_train_rows)
+    validation = _sample_encoded_rows(dataset_spec(config).validation_dir, audit_config.ablation_validation_rows)
     device = resolve_device(config.device); torch.manual_seed(audit_config.random_seed)
     variants = {"A_all_features": (), "B_without_user_id": ("user_id",), "C_without_product_id": ("product_id",), "D_without_user_id_and_product_id": ("user_id", "product_id")}
     result: dict[str, Any] = {"ran": True, "temporary": True, "objective": "CVR-only small-sample comparison; no checkpoint is written", "sample_rows": {"train": len(train["label"]), "validation": len(validation["label"])}, "epochs": audit_config.ablation_epochs, "variants": {}}
@@ -378,7 +527,82 @@ def run_id_memorization_ablation(config: FineRankConfig, audit_config: FineRankA
     return result
 
 
-def _sample_encoded_rows(directory: Path, maximum: int, transform: Mapping[str, float]) -> dict[str, np.ndarray]:
+def _temporal_logistic_baseline(config: FineRankConfig, audit_config: FineRankAuditConfig) -> dict[str, Any]:
+    train = _sample_encoded_rows(dataset_spec(config).cache_dir, audit_config.temporal_experiment_train_rows)
+    validation = _sample_encoded_rows(dataset_spec(config).validation_dir, audit_config.temporal_experiment_validation_rows)
+    if len(np.unique(train["label"])) < 2:
+        return {"available": False, "reason": "Future-A sample has only one class"}
+    model = LogisticRegression(max_iter=200, random_state=audit_config.random_seed, n_jobs=1)
+    model.fit(train["dense"], train["label"].astype(np.int8))
+    probabilities = model.predict_proba(validation["dense"])[:, 1].astype(np.float32)
+    return {"available": True, "train_rows": len(train["label"]), "validation_rows": len(validation["label"]), "features": list(DENSE_FEATURES), **_metrics_with_calibration(validation["label"].astype(np.int8), probabilities, audit_config.calibration_bins)}
+
+
+def run_temporal_id_ablation(config: FineRankConfig, audit_config: FineRankAuditConfig, current_metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Controlled small temporal re-trains with compact ID capacity."""
+    experiment = _temporal_friendly_config(config, audit_config)
+    train = _sample_encoded_rows(dataset_spec(config).cache_dir, audit_config.temporal_experiment_train_rows)
+    validation = _sample_encoded_rows(dataset_spec(config).validation_dir, audit_config.temporal_experiment_validation_rows)
+    variants = {"A_all_features": (), "B_remove_user_id": ("user_id",), "C_remove_product_id": ("product_id",), "D_remove_user_id_and_product_id": ("user_id", "product_id")}
+    result: dict[str, Any] = {"ran": True, "temporary": True, "production_current_checkpoint": dict(current_metrics), "comparison_semantics": "Production current checkpoint is reported separately. A/B/C/D are controlled temporary re-trains with the same compact temporal-friendly architecture, so the ID removal comparison is not confounded by capacity.", "architecture": _experiment_architecture(experiment), "sample_rows": {"train": len(train["label"]), "validation": len(validation["label"])}, "epochs": audit_config.ablation_epochs, "early_stopping_patience": experiment.patience, "variants": {}}
+    for name, removed in variants.items():
+        fitted = _train_temporary_cvr_model(experiment, train, validation, audit_config.ablation_epochs, audit_config.ablation_batch_size, audit_config.random_seed, removed)
+        result["variants"][name] = {**_metrics_with_calibration(validation["label"].astype(np.int8), fitted["probabilities"], audit_config.calibration_bins), "best_epoch": fitted["best_epoch"], "epochs_completed": fitted["epochs_completed"]}
+    return result
+
+
+def run_temporal_epoch_sweep(config: FineRankConfig, audit_config: FineRankAuditConfig) -> dict[str, Any]:
+    """Test whether the compact no-raw-ID model is materially underfit at epoch 1."""
+    experiment = _temporal_friendly_config(config, audit_config)
+    train = _sample_encoded_rows(dataset_spec(config).cache_dir, audit_config.temporal_experiment_train_rows)
+    validation = _sample_encoded_rows(dataset_spec(config).validation_dir, audit_config.temporal_experiment_validation_rows)
+    results: dict[str, Any] = {}
+    for epochs in audit_config.temporal_experiment_epochs:
+        fitted = _train_temporary_cvr_model(experiment, train, validation, epochs, audit_config.ablation_batch_size, audit_config.random_seed, ("user_id", "product_id"))
+        results[str(epochs)] = {**_metrics_with_calibration(validation["label"].astype(np.int8), fitted["probabilities"], audit_config.calibration_bins), "best_epoch": fitted["best_epoch"], "epochs_completed": fitted["epochs_completed"]}
+    pr_values = {int(epochs): metrics["pr_auc"] for epochs, metrics in results.items() if metrics["pr_auc"] is not None}
+    best_epoch = max(pr_values, key=pr_values.get) if pr_values else None
+    return {"ran": True, "temporary": True, "architecture": _experiment_architecture(experiment), "removed_features": ["user_id", "product_id"], "sample_rows": {"train": len(train["label"]), "validation": len(validation["label"])}, "results": results, "best_epoch_by_pr_auc": best_epoch, "interpretation": "A material improvement from epoch 1 to the best later epoch indicates underfitting. This is a small-sample diagnosis, not a production checkpoint selection."}
+
+
+def _temporal_friendly_config(config: FineRankConfig, audit_config: FineRankAuditConfig) -> FineRankConfig:
+    buckets = list(config.bucket_sizes)
+    for name in ("user_id", "product_id"):
+        buckets[SPARSE_FEATURES.index(name)] = min(buckets[SPARSE_FEATURES.index(name)], audit_config.temporal_id_bucket_size)
+    return replace(config, embedding_dim=audit_config.temporal_embedding_dim, hidden_dims=audit_config.temporal_hidden_dims, bucket_sizes=tuple(buckets))
+
+
+def _experiment_architecture(config: FineRankConfig) -> dict[str, Any]:
+    return {"embedding_dim": config.embedding_dim, "hidden_dims": list(config.hidden_dims), "user_id_bucket": config.bucket_sizes[SPARSE_FEATURES.index("user_id")], "product_id_bucket": config.bucket_sizes[SPARSE_FEATURES.index("product_id")]}
+
+
+def _train_temporary_cvr_model(config: FineRankConfig, train: Mapping[str, np.ndarray], validation: Mapping[str, np.ndarray], epochs: int, batch_size: int, seed: int, removed_features: Sequence[str]) -> dict[str, Any]:
+    device = resolve_device(config.device); torch.manual_seed(seed)
+    sparse_train = np.asarray(train["sparse"], dtype=np.int64).copy(); sparse_validation = np.asarray(validation["sparse"], dtype=np.int64).copy()
+    for feature in removed_features:
+        index = SPARSE_FEATURES.index(feature); sparse_train[:, index] = 0; sparse_validation[:, index] = 0
+    model = build_model(config).to(device); optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    dataset = TensorDataset(torch.from_numpy(np.asarray(train["dense"], dtype=np.float32)), torch.from_numpy(sparse_train), torch.from_numpy(np.asarray(train["label"], dtype=np.float32)))
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    labels_validation = np.asarray(validation["label"], dtype=np.int8); best_probabilities: np.ndarray | None = None; best_score = -float("inf"); best_epoch = 0; stale = 0
+    for epoch in range(1, epochs + 1):
+        model.train()
+        for dense, sparse, labels in loader:
+            optimizer.zero_grad(set_to_none=True); logits, _ = model(dense.to(device), sparse.to(device)); loss = F.binary_cross_entropy_with_logits(logits, labels.to(device)); loss.backward(); optimizer.step()
+        model.eval()
+        with torch.no_grad():
+            probabilities = model.predict(torch.from_numpy(np.asarray(validation["dense"], dtype=np.float32)).to(device), torch.from_numpy(sparse_validation).to(device))[0].detach().to(dtype=torch.float32).cpu().numpy()
+        score = float(average_precision_score(labels_validation, probabilities)) if len(np.unique(labels_validation)) == 2 else -float(np.mean(np.square(probabilities - labels_validation)))
+        if score > best_score:
+            best_score = score; best_probabilities = probabilities; best_epoch = epoch; stale = 0
+        else:
+            stale += 1
+            if stale >= config.patience:
+                return {"probabilities": best_probabilities, "best_epoch": best_epoch, "epochs_completed": epoch}
+    return {"probabilities": best_probabilities, "best_epoch": best_epoch, "epochs_completed": epochs}
+
+
+def _sample_encoded_rows(directory: Path, maximum: int) -> dict[str, np.ndarray]:
     dense_columns = [f"dense__{name}" for name in DENSE_FEATURES]; sparse_columns = [f"sparse__{name}" for name in SPARSE_FEATURES]; columns = [*dense_columns, *sparse_columns, "conversion_label"]
     dense_parts: list[np.ndarray] = []; sparse_parts: list[np.ndarray] = []; labels: list[np.ndarray] = []; rows = 0
     for part in sorted(directory.glob("part-*.parquet")):
@@ -432,6 +656,24 @@ def _write_full_vs_temporal_report(temporal_report: Mapping[str, Any], audit_con
     lines.extend(f"| {name} | {values['full_iid_upper_bound']} | {values['temporal_final']} |" for name, values in result["metrics"].items())
     lines.extend([f"| ECE | {result['full_ece']} | {result['temporal_ece']} |", ""])
     markdown.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def _write_temporal_diagnostic_comparison(report: Mapping[str, Any], audit_config: FineRankAuditConfig) -> Path:
+    """A compact comparison surface for the current model and strict baselines."""
+    path = audit_config.output_path.parent / "fine_rank_temporal_diagnostic_comparison.json"
+    second = report["temporal_second_stage"]
+    result: dict[str, Any] = {
+        "policy": "Compare only click-conditioned CVR classification. Ranking metrics are unavailable without reliable request-time candidate negatives.",
+        "current_dcnv2": report["classification_metrics"] | {"ece": report["calibration"]["ece"]},
+        "past_only_baselines": second["past_only_baselines"],
+        "seen_unseen_slices": second["seen_unseen_slices"],
+        "candidate_count_diagnostic": second["validation_candidate_count_distribution"],
+        "value_head": second["value_head"],
+        "id_memorization_ablation": report["id_memorization_ablation"],
+        "epoch_sweep": report.get("epoch_sweep", {"ran": False, "command_flag": "--with-id-ablation"}),
+    }
+    path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     return path
 
 

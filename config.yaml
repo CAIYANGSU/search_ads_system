@@ -265,6 +265,14 @@ temporal:
   # overlays this bounded block and intentionally skips inference.
   fine_rank:
     sanity:
+      # Temporal data has far fewer observed interactions and substantial
+      # user/product cold start, so do not allocate the full-mode 1M x 32
+      # raw-ID embedding capacity in this fresh sanity checkpoint.
+      embedding_dim: 16
+      hidden_dims: [64, 32]
+      hash_buckets:
+        user_id: 65537
+        product_id: 65537
       max_train_rows: 200000
       epochs: 1
       batch_size: 4096
@@ -280,6 +288,15 @@ temporal:
       ablation_validation_rows: 50000
       ablation_epochs: 1
       ablation_batch_size: 8192
+      # Compact temporal diagnostic models: deliberately avoid 1M-bucket,
+      # 32-dim raw-ID capacity for a ~64k-row sanity experiment.
+      temporal_embedding_dim: 16
+      temporal_id_bucket_size: 65537
+      temporal_hidden_dims: [64, 32]
+      temporal_experiment_train_rows: 100000
+      temporal_experiment_validation_rows: 100000
+      temporal_experiment_epochs: [1, 3, 5]
+      temporal_prior_smoothing: 20.0
   recall:
     itemcf_top_k: 100
     two_tower_top_k: 100

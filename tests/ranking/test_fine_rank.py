@@ -274,3 +274,26 @@ def test_temporal_uses_past_only_features_with_future_labels(tmp_path: Path) -> 
     assert row["dense"][DENSE_FEATURES.index("product_price")] == pytest.approx(np.log1p(1.0) / 5.0)
     assert row["dense"][DENSE_FEATURES.index("coarse_score")] == 0.0
     assert row["dense"][DENSE_FEATURES.index("rrf_score")] == 0.0
+
+
+def test_temporal_audit_reports_seen_slices_baselines_and_nonranking_policy(tmp_path: Path) -> None:
+    past = tmp_path / "temporal" / "split" / "past"; future_a = tmp_path / "temporal" / "split" / "future_a"; future_b = tmp_path / "temporal" / "split" / "future_b"
+    past.mkdir(parents=True); future_a.mkdir(parents=True); future_b.mkdir(parents=True)
+    pd.DataFrame([{"user_id": "u1", "product_id": "a1", "conversion_label": 0, "click_timestamp": 1, "product_price": 1., "clicks_last_7d": 1, "product_brand": "b", "product_category_1": "c"}]).to_csv(past / "part-00000.csv", index=False)
+    pd.DataFrame([{"user_id": "u1", "product_id": "a1", "conversion_label": 1, "conversion_value_eur": 2., "click_timestamp": 2}]).to_csv(future_a / "part-00000.csv", index=False)
+    pd.DataFrame([{"user_id": "u2", "product_id": "a1", "conversion_label": 0, "click_timestamp": 3}]).to_csv(future_b / "part-00000.csv", index=False)
+    candidates = tmp_path / "temporal" / "ranking" / "coarse.csv"; candidates.parent.mkdir(parents=True)
+    pd.DataFrame([{"user_id": "u2", "candidate_ad_id": "a1", "rank": 1}]).to_csv(candidates, index=False)
+    config = FineRankConfig(mode="temporal", input_path=candidates, output_path=tmp_path / "temporal" / "ranking" / "fine.csv", model_path=tmp_path / "temporal" / "models" / "model.pt", cache_dir=tmp_path / "temporal" / "ranking" / "fine_rank" / "train", feature_source_path=past, train_label_path=future_a, validation_label_path=future_b, metrics_path=tmp_path / "temporal" / "metrics" / "fine_rank_metrics.json", max_train_rows=10, chunk_size=10, embedding_dim=4, hidden_dims=(8,), num_cross_layers=1, batch_size=1, inference_batch_size=1, epochs=1, num_workers=0, prefetch_factor=1, persistent_workers=False, bucket_sizes=(17,) * len(SPARSE_FEATURES), validation_fraction=.1)
+    metadata = build_dataset(config)
+    train_fine_ranker(config, metadata)
+    result = run_fine_rank_audit(config, FineRankAuditConfig(output_path=tmp_path / "temporal" / "metrics" / "fine_rank_audit.json", calibration_bins=10, ablation_train_rows=1, ablation_validation_rows=1, temporal_experiment_train_rows=1, temporal_experiment_validation_rows=1, temporal_experiment_epochs=(1,)), include_ablation=True)
+    report = json.loads((tmp_path / "temporal" / "metrics" / "fine_rank_audit.json").read_text())
+    second_stage = report["temporal_second_stage"]
+    assert set(second_stage["seen_unseen_slices"]) == {"seen_user_seen_product", "seen_user_unseen_product", "unseen_user_seen_product", "unseen_user_unseen_product"}
+    assert second_stage["ranking_evaluation"]["available"] is False
+    assert set(second_stage["past_only_baselines"]) >= {"global_positive_rate", "product_past_cvr_prior", "brand_category_past_cvr_prior", "future_a_logistic_regression_no_raw_ids"}
+    assert "predicted_conversion_value" in second_stage["value_head"]
+    assert Path(result["temporal_diagnostic_comparison_path"]).is_file()
+    assert report["id_memorization_ablation"]["ran"] is True
+    assert report["epoch_sweep"]["ran"] is True

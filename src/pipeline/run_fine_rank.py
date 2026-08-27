@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -22,7 +23,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config.yaml")
     parser.add_argument("--stage", choices=("build_dataset", "train", "evaluate", "infer", "audit", "temporal_sanity", "all"), default="all")
     parser.add_argument("--temporal", action="store_true", help="Use isolated outputs/temporal Fine Rank artifacts for the selected stage.")
-    parser.add_argument("--with-id-ablation", action="store_true", help="Run the small temporary A/B/C/D ID memorization experiment during --stage audit.")
+    parser.add_argument("--with-id-ablation", action="store_true", help="Run temporary ID ablation; in temporal mode also runs the compact 1/3/5-epoch sweep.")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config_path = args.config.resolve()
@@ -35,6 +36,15 @@ def main() -> None:
             raise ValueError("temporal.fine_rank.sanity must be a mapping")
         temporal_fine.update(sanity); temporal["fine_rank"] = temporal_fine; fine["mode"] = "temporal"; raw["fine_rank"] = fine; raw["temporal"] = temporal
     config = parse_fine_rank_config(raw, config_path)
+    if args.stage == "temporal_sanity":
+        temporal_root = config.metrics_path.parent.parent
+        config = replace(
+            config,
+            output_path=temporal_root / "ranking" / "fine_rank_sanity_topk.csv",
+            model_path=temporal_root / "models" / "fine_rank_dcnv2_sanity.pt",
+            cache_dir=temporal_root / "ranking" / "fine_rank_sanity" / "train",
+            metrics_path=temporal_root / "metrics" / "fine_rank_sanity_metrics.json",
+        )
     if config.mode == "temporal":
         temporal_config = parse_temporal_config(raw, config_path)
         build_temporal_split(temporal_config)
@@ -46,7 +56,8 @@ def main() -> None:
         evaluation = evaluate_fine_ranker(model, config, metadata=dataset)
         config.metrics_path.parent.mkdir(parents=True, exist_ok=True)
         config.metrics_path.write_text(json.dumps(evaluation, indent=2, sort_keys=True), encoding="utf-8")
-        result = {"temporal_split": str(temporal_config.output_dir / "split" / "metadata.json"), "dataset": dataset, "training": training, "evaluation": evaluation, "audit": run_fine_rank_audit(config, parse_fine_rank_audit_config(raw, config_path, config), include_ablation=args.with_id_ablation)}
+        audit_config = replace(parse_fine_rank_audit_config(raw, config_path, config), output_path=config.metrics_path.parent / "fine_rank_sanity_audit.json")
+        result = {"temporal_split": str(temporal_config.output_dir / "split" / "metadata.json"), "dataset": dataset, "training": training, "evaluation": evaluation, "audit": run_fine_rank_audit(config, audit_config, include_ablation=args.with_id_ablation)}
     else:
         result = (
             {"audit": run_fine_rank_audit(config, parse_fine_rank_audit_config(raw, config_path, config), include_ablation=args.with_id_ablation)}

@@ -266,7 +266,7 @@ def evaluate_fine_ranker(model: DCNv2MultiTask, config: FineRankConfig, *, split
                 probability, predicted_log_value, predicted_value, _ = model.predict_with_log(dense, sparse, **_prediction_kwargs(transform))
                 diagnostics.update(predicted_log_value.cpu().numpy(), predicted_value.cpu().numpy())
                 yield {"label": labels.cpu().numpy(), "pcvr": probability.cpu().numpy(), "predicted_value": predicted_value.cpu().numpy(), "observed_value": batch["observed_value"].numpy(), "value_mask": masks.cpu().numpy(), "user_id": batch["user_id"], "candidate_ad_id": batch["candidate_ad_id"], "coarse_score": batch["coarse_score"].numpy()}
-    result = evaluate_fine_rank_predictions(batches())
+    result = evaluate_fine_rank_predictions(batches(), allow_observed_click_ranking=config.mode != "temporal")
     result["prediction_diagnostics"] = diagnostics.summary()
     return result
 
