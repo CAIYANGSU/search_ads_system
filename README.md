@@ -126,6 +126,13 @@ CVR negative。金额 Huber loss 使用 train split 统计量标准化后的 `lo
 输入的连续特征采用有界 log 表示，Cross Network 的乘性交叉固定在 fp32，训练使用
 gradient clipping；任何非有限输入、梯度、参数或预测都会显式失败并报告，而不会被跳过。
 
+已有 checkpoint 的效果审计不训练、不改写权重。它会生成 validation 的 ROC-AUC、PR-AUC、LogLoss、Brier、预测分布与 calibration/ECE，量化 train/validation 的 user、product、user-product 重叠和重复交互，并分块检查精排输出的极端分数。full mode 的行级随机切分会被明确标记为非最终因果成绩；报告同时给出 unseen-user/product/pair 严格子集。可选的 ID 消融只训练四个小样本临时模型，绝不会写生产 checkpoint。
+
+```bash
+PYTHONPATH=src python src/pipeline/run_fine_rank.py --config config.yaml --stage audit
+PYTHONPATH=src python src/pipeline/run_fine_rank.py --config config.yaml --stage audit --with-id-ablation
+```
+
 ```bash
 # build_dataset | train | evaluate | infer | all
 PYTHONPATH=src python src/pipeline/run_fine_rank.py --config config.yaml --stage all

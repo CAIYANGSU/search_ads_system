@@ -216,6 +216,17 @@ fine_rank:
   pin_memory: true
   persistent_workers: true
   amp: true
+  # Read-only checkpoint/cache audit.  This does not retrain or modify the
+  # production DCNv2 checkpoint.  The optional A/B/C/D ID ablation is enabled
+  # only with `run_fine_rank.py --stage audit --with-id-ablation`.
+  audit:
+    output_path: outputs/metrics/fine_rank_audit.json
+    calibration_bins: 20
+    output_chunk_size: 500000
+    ablation_train_rows: 100000
+    ablation_validation_rows: 50000
+    ablation_epochs: 1
+    ablation_batch_size: 8192
   early_stopping:
     enabled: true
     patience: 2

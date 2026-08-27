@@ -33,6 +33,7 @@ from search_ads_system.ranking.fine_rank_dataset import (
     encode_feature_frame,
     stable_hash,
 )
+from search_ads_system.ranking.fine_rank_audit import FineRankAuditConfig, run_fine_rank_audit, run_id_memorization_ablation
 
 
 def _write_fixture(tmp_path: Path) -> tuple[Path, Path]:
@@ -196,6 +197,38 @@ def test_float16_gpu_predictions_are_promoted_before_pandas_ranking() -> None:
     assert ranked_half[["user_id", "candidate_ad_id", "rank"]].equals(
         ranked_reference[["user_id", "candidate_ad_id", "rank"]]
     )
+
+
+def test_read_only_effect_audit_reports_metrics_calibration_overlap_and_split_warning(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    metadata = build_dataset(config)
+    train_fine_ranker(config, metadata)
+    result = run_fine_rank_audit(config, FineRankAuditConfig(output_path=tmp_path / "fine_rank_audit.json", calibration_bins=10))
+    report = json.loads((tmp_path / "fine_rank_audit.json").read_text())
+    assert result["report_path"].endswith("fine_rank_audit.json")
+    assert set(report["classification_metrics"]) == {"roc_auc", "pr_auc", "logloss", "brier_score", "positive_rate"}
+    assert len(report["calibration"]["bins"]) == 10
+    assert "exact_user_product_pair_overlap" in report["train_validation_overlap"]
+    assert set(report["strict_holdout_slices"]) >= {"unseen_user", "unseen_product", "unseen_user_product_pair"}
+    assert report["split_audit"]["row_random_split"] is True
+    assert report["leakage_audit"]["passed_static_feature_guard"] is True
+    assert report["id_memorization_ablation"]["ran"] is False
+
+
+def test_small_id_memorization_ablation_is_temporary_and_has_all_variants(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    build_dataset(config)
+    result = run_id_memorization_ablation(
+        config,
+        FineRankAuditConfig(
+            output_path=tmp_path / "unused.json", ablation_train_rows=3,
+            ablation_validation_rows=1, ablation_epochs=1, ablation_batch_size=2,
+        ),
+    )
+    assert result["ran"] is True and result["temporary"] is True
+    assert set(result["variants"]) == {
+        "A_all_features", "B_without_user_id", "C_without_product_id", "D_without_user_id_and_product_id",
+    }
 
 
 def test_vectorized_100k_candidate_preprocessing_benchmark(tmp_path: Path) -> None:
