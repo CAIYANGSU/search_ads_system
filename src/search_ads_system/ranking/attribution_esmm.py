@@ -144,13 +144,33 @@ class AttributionESMM(nn.Module):
 
 
 def esmm_loss(outputs: Mapping[str, Tensor], click: Tensor, click_and_conversion: Tensor, lambda_ctcvr: float = 1.0, eps: float = 1e-7) -> dict[str, Tensor]:
-    """Numerically guarded impression-space CTR + CTCVR ESMM objective."""
+    """Numerically guarded impression-space CTR + CTCVR ESMM objective.
+
+    The forward pass may be under CUDA AMP.  Probability BCE is explicitly
+    outside autocast because PyTorch rejects it in reduced precision.  CTCVR
+    is still the standard ESMM product, recomputed from its two logits in
+    float32; no independent CTCVR head/logit is introduced.
+    """
 
     if lambda_ctcvr < 0.0 or not 0.0 < eps < 0.5:
         raise ValueError("lambda_ctcvr must be non-negative and eps must be in (0, 0.5)")
-    ctr = F.binary_cross_entropy_with_logits(outputs["ctr_logit"], click)
-    ctcvr = F.binary_cross_entropy(outputs["pctcvr"].clamp(min=eps, max=1.0 - eps), click_and_conversion)
+    device_type = outputs["ctr_logit"].device.type
+    with torch.autocast(device_type=device_type, enabled=False):
+        ctr_logit = outputs["ctr_logit"].float()
+        cvr_logit = outputs["cvr_logit"].float()
+        pctr = torch.sigmoid(ctr_logit)
+        pcvr = torch.sigmoid(cvr_logit)
+        pctcvr = pctr * pcvr
+        ctr = F.binary_cross_entropy_with_logits(ctr_logit, click.float())
+        ctcvr = F.binary_cross_entropy(
+            pctcvr.clamp(min=eps, max=1.0 - eps), click_and_conversion.float()
+        )
     total = ctr + float(lambda_ctcvr) * ctcvr
-    if not torch.isfinite(total):
-        raise FloatingPointError("Attribution ESMM loss is non-finite")
+    probabilities = {"pCTR": pctr, "pCVR": pcvr, "pCTCVR": pctcvr}
+    if any(not torch.isfinite(value).all() for value in (total, ctr, ctcvr, *probabilities.values())):
+        raise FloatingPointError("Attribution ESMM loss/probability is non-finite")
+    if any(((value < 0.0) | (value > 1.0)).any() for value in probabilities.values()):
+        raise FloatingPointError("Attribution ESMM probability fell outside [0, 1]")
+    if not torch.equal(pctcvr, pctr * pcvr):
+        raise AssertionError("Attribution ESMM must keep pCTCVR equal to pCTR * pCVR")
     return {"total": total, "ctr": ctr, "ctcvr": ctcvr}

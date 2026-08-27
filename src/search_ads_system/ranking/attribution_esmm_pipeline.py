@@ -298,6 +298,9 @@ def train_model(
             if not torch.isfinite(losses["total"]):
                 raise FloatingPointError(f"{kind} loss became non-finite")
             scaler.scale(losses["total"]).backward()
+            if kind == "esmm":
+                scaler.unscale_(optimizer)
+                _assert_finite_gradients(model)
             scaler.step(optimizer)
             scaler.update()
             _assert_finite_parameters(model)
@@ -597,6 +600,11 @@ def _set_seed(seed: int) -> None:
 def _assert_finite_parameters(model: nn.Module) -> None:
     if any(not torch.isfinite(parameter).all() for parameter in model.parameters()):
         raise FloatingPointError("Attribution model parameters became non-finite")
+
+
+def _assert_finite_gradients(model: nn.Module) -> None:
+    if any(parameter.grad is not None and not torch.isfinite(parameter.grad).all() for parameter in model.parameters()):
+        raise FloatingPointError("Attribution ESMM gradients became non-finite")
 
 
 def _atomic_write(path: Path, content: str) -> None:

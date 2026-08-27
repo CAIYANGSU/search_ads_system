@@ -37,9 +37,31 @@ def test_esmm_probability_contract_loss_and_backward() -> None:
     labels = torch.tensor([0.0, 1.0, 1.0, 0.0, 1.0, 0.0])
     ctcvr = torch.tensor([0.0, 0.0, 1.0, 0.0, 1.0, 0.0])
     losses = esmm_loss(outputs, labels, ctcvr)
-    assert torch.isfinite(losses["total"])
+    assert all(torch.isfinite(loss).all() for loss in losses.values())
     losses["total"].backward()
-    assert all(parameter.grad is not None for parameter in model.parameters() if parameter.requires_grad)
+    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in model.parameters() if parameter.requires_grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA AMP")
+def test_esmm_cuda_amp_training_step_uses_fp32_probability_bce() -> None:
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    model = AttributionESMM((31,) * len(CATEGORICAL_FEATURES), 4, (8,), (4,), (4,)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    scaler = torch.amp.GradScaler("cuda")
+    sparse = torch.randint(0, 31, (8, len(CATEGORICAL_FEATURES)), device=device)
+    dense = torch.randn(8, len(DENSE_FEATURES), device=device)
+    click = torch.tensor([0, 1, 1, 0, 1, 0, 1, 0], dtype=torch.float32, device=device)
+    ctcvr = torch.tensor([0, 0, 1, 0, 1, 0, 0, 0], dtype=torch.float32, device=device)
+    with torch.autocast(device_type="cuda", enabled=True):
+        outputs = model(sparse, dense)
+        losses = esmm_loss(outputs, click, ctcvr)
+    assert all(torch.isfinite(loss).all() for loss in losses.values())
+    scaler.scale(losses["total"]).backward()
+    scaler.unscale_(optimizer)
+    assert all(parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in model.parameters())
+    scaler.step(optimizer)
+    scaler.update()
 
 
 def test_label_combinations_hashing_and_feature_guard() -> None:
