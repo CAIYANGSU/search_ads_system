@@ -389,6 +389,26 @@ auction:
   mechanism: second_price
   reserve_price: 0.0
 
+# All fields below govern an explicitly synthetic offline simulation. The
+# pipeline reads Attribution Future-A calibration artifacts only and never
+# joins them to Search Conversion records.
+business_simulation:
+  output_dir: outputs/business_simulation
+  seed: 2026
+  candidates_per_auction: 5
+  mechanism: second_price
+  base_bid: 1.0
+  total_budget: 1000.0
+  pacing_min: 0.5
+  pacing_max: 2.0
+  max_rows: null
+  # Optional standalone clicked-interaction predictions. Expected columns:
+  # pCVR_clicked, predicted_conditional_value, conversion_value_eur.
+  # This input is never joined with Attribution rows.
+  search_prediction_path: null
+  sanity:
+    max_rows: 100000
+
 evaluation:
   metrics: [auc, logloss, ndcg]
 

@@ -1,0 +1,1 @@
+"""Advertising business simulation tests."""
