@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from search_ads_system.common.config import load_yaml_config  # noqa: E402
+from search_ads_system.evaluation.final_holdout import future_b_opened_warning  # noqa: E402
 from search_ads_system.evaluation.temporal import build_future_ab_split, build_temporal_split, parse_temporal_config  # noqa: E402
 from search_ads_system.ranking.fine_rank import build_dataset, evaluate_fine_ranker, load_fine_ranker, parse_fine_rank_config, run_fine_rank, train_fine_ranker  # noqa: E402
 from search_ads_system.ranking.fine_rank_audit import parse_fine_rank_audit_config, run_fine_rank_audit  # noqa: E402
@@ -27,6 +28,7 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config_path = args.config.resolve()
+    if warning := future_b_opened_warning(config_path): logging.warning(warning)
     raw = load_yaml_config(config_path)
     if args.temporal:
         fine = dict(raw.get("fine_rank", {})); fine["mode"] = "temporal"; raw["fine_rank"] = fine

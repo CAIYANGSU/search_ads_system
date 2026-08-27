@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from search_ads_system.common.config import load_yaml_config  # noqa: E402
+from search_ads_system.evaluation.final_holdout import future_b_opened_warning  # noqa: E402
 from search_ads_system.ranking.coarse_rank import parse_coarse_rank_config, run_coarse_rank  # noqa: E402
 from search_ads_system.recall.itemcf_recall import (  # noqa: E402
     generate_itemcf_candidates, load_interactions as load_itemcf, parse_itemcf_config, write_candidates as write_itemcf,
@@ -49,6 +50,7 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config_path = args.config.resolve()
+    if warning := future_b_opened_warning(config_path): logging.warning(warning)
     print(json.dumps(run_formal_funnel(load_yaml_config(config_path), config_path, args.stage), indent=2, sort_keys=True))
 
 

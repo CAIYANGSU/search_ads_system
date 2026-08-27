@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from search_ads_system.ads.simulator import SimulationConfig, future_b_isolation_contract, simulate_attribution, simulate_search_conversion
 from search_ads_system.common.config import load_yaml_config, resolve_path
+from search_ads_system.evaluation.final_holdout import future_b_opened_warning
 from search_ads_system.ranking.attribution_calibration import IsotonicCalibrator, PlattCalibrator, RawCalibrator, serving_consistent_probabilities
 from search_ads_system.ranking.attribution_calibration_pipeline import parse_attribution_calibration_config
 
@@ -91,7 +92,8 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=ROOT / "config.yaml")
     parser.add_argument("--stage", choices=("sanity", "all"), required=True)
     args = parser.parse_args(); config_path = args.config.resolve(); raw = load_yaml_config(config_path); options, output = _options(raw, config_path, args.stage)
-    simulation = SimulationConfig(seed=int(options.get("seed", 2026)), candidates_per_auction=int(options.get("candidates_per_auction", 5)), base_bid=float(options.get("base_bid", 1.0)), mechanism=str(options.get("mechanism", "second_price")), total_budget=float(options.get("total_budget", 1000.0)), pacing_min=float(options.get("pacing_min", .5)), pacing_max=float(options.get("pacing_max", 2.0)))
+    if warning := future_b_opened_warning(config_path): print(f"WARNING: {warning}", file=sys.stderr)
+    simulation = SimulationConfig(seed=int(options.get("seed", 2026)), candidates_per_auction=int(options.get("candidates_per_auction", 5)), base_bid=float(options.get("base_bid", 1.0)), mechanism=str(options.get("mechanism", "second_price")), total_budget=float(options.get("total_budget", 1000.0)), pacing_min=float(options.get("pacing_min", .5)), pacing_max=float(options.get("pacing_max", 2.0)), budget_levels=tuple(float(value) for value in options.get("budget_levels", (.25, .5, .75, 1.0))))
     limit = options.get("max_rows"); limit = None if limit is None else int(limit)
     attribution, calibrated = _load_attribution(raw, config_path, args.stage, limit)
     attribution_report, policy, curve = simulate_attribution(attribution, config=simulation, calibrated_available=calibrated)

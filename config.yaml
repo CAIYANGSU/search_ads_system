@@ -407,6 +407,7 @@ business_simulation:
   total_budget: 1000.0
   pacing_min: 0.5
   pacing_max: 2.0
+  budget_levels: [0.25, 0.50, 0.75, 1.0]
   max_rows: null
   # Optional standalone clicked-interaction predictions. Expected columns:
   # pCVR_clicked, predicted_conditional_value, conversion_value_eur.
@@ -418,6 +419,13 @@ business_simulation:
 
 evaluation:
   metrics: [auc, logloss, ndcg]
+
+# One-way final holdout settings. These thresholds are frozen before Future-B
+# is opened and are used only to describe observed degradation.
+final_evaluation:
+  output_dir: outputs/final_evaluation
+  moderate_degradation_threshold: 0.05
+  large_degradation_threshold: 0.15
 
 # Isolated strict-time offline experiment.  Artifacts stay below outputs/temporal
 # and must never reuse full-data recall checkpoints or fused candidates.

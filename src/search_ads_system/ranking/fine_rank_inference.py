@@ -33,8 +33,14 @@ def checkpoint_config(checkpoint_path: Path, fallback: FineRankMultiTaskConfig) 
 
 def write_future_a_predictions(config: FineRankMultiTaskConfig, *, checkpoint_path: Path, output_dir: Path, max_rows: int | None = None) -> dict[str, Any]:
     """Infer on Search Conversion Future-A only; Future-B is never opened."""
-    if not config.future_a_path.is_dir():
-        raise FileNotFoundError(f"Future-A source missing: {config.future_a_path}")
+    return write_predictions_for_split(config, source_path=config.future_a_path, checkpoint_path=checkpoint_path, output_dir=output_dir, split_name="future_a", max_rows=max_rows)
+
+
+def write_predictions_for_split(config: FineRankMultiTaskConfig, *, source_path: Path, checkpoint_path: Path, output_dir: Path, split_name: str, max_rows: int | None = None) -> dict[str, Any]:
+    """Infer a declared holdout split from a frozen DCNv2 checkpoint only."""
+    if split_name not in {"future_a", "future_b"}: raise ValueError("prediction split must be future_a or future_b")
+    if not source_path.is_dir():
+        raise FileNotFoundError(f"{split_name} source missing: {source_path}")
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Selected DCNv2 checkpoint missing: {checkpoint_path}")
     effective = checkpoint_config(checkpoint_path, config)
@@ -47,7 +53,7 @@ def write_future_a_predictions(config: FineRankMultiTaskConfig, *, checkpoint_pa
     for part in output_dir.glob("part-*.csv"): part.unlink()
     rows = parts = 0; time_min = time_max = None
     with torch.no_grad():
-        for frame in _future_a_frames(effective.future_a_path, effective.chunk_size, max_rows):
+        for frame in _future_a_frames(source_path, effective.chunk_size, max_rows):
             encoded, original = _encode_for_prediction(frame, effective)
             if encoded.empty: continue
             dense = torch.from_numpy(encoded[[f"dense__{name}" for name in DENSE_FEATURES]].to_numpy(np.float32))
@@ -64,9 +70,9 @@ def write_future_a_predictions(config: FineRankMultiTaskConfig, *, checkpoint_pa
             write_csv_part(result, output_dir, parts); parts += 1; rows += len(result)
             timestamps = pd.to_numeric(original.get("click_timestamp"), errors="coerce").dropna()
             if len(timestamps): time_min = int(timestamps.min()) if time_min is None else min(time_min, int(timestamps.min())); time_max = int(timestamps.max()) if time_max is None else max(time_max, int(timestamps.max()))
-    metadata = {"checkpoint": str(checkpoint_path), "model": "dcnv2", "row_count": rows, "part_count": parts, "timestamp_split_source": str(effective.future_a_path), "timestamp_min": time_min, "timestamp_max": time_max, "future_b_read": False, "task_semantics": {"pCVR_clicked": "P(conversion | clicked interaction)", "predicted_conditional_value": "E[conversion_value_eur | conversion=1, clicked interaction]", "expected_value_per_click": "pCVR_clicked * predicted_conditional_value; clicked-interaction quantity only"}}
-    metadata_path = output_dir.parent / "future_a_predictions_metadata.json"; metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
-    return {"prediction_dir": str(output_dir), "metadata_path": str(metadata_path), "future_b_read": False, "row_count": rows}
+    metadata = {"checkpoint": str(checkpoint_path), "model": "dcnv2", "row_count": rows, "part_count": parts, "timestamp_split_source": str(source_path), "timestamp_min": time_min, "timestamp_max": time_max, "future_b_read": split_name == "future_b", "task_semantics": {"pCVR_clicked": "P(conversion | clicked interaction)", "predicted_conditional_value": "E[conversion_value_eur | conversion=1, clicked interaction]", "expected_value_per_click": "pCVR_clicked * predicted_conditional_value; clicked-interaction quantity only"}}
+    metadata_path = output_dir.parent / f"{split_name}_predictions_metadata.json"; metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+    return {"prediction_dir": str(output_dir), "metadata_path": str(metadata_path), "future_b_read": split_name == "future_b", "row_count": rows}
 
 
 def _future_a_frames(path: Path, chunk_size: int, limit: int | None) -> Iterator[pd.DataFrame]:

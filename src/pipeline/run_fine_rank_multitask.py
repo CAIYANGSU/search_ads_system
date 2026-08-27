@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from search_ads_system.common.config import load_yaml_config
+from search_ads_system.evaluation.final_holdout import future_b_opened_warning
 from search_ads_system.ranking.fine_rank_multitask import parse_fine_rank_multitask_config, run_fine_rank_multitask
 
 
@@ -22,6 +23,7 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config_path = args.config.resolve()
+    if warning := future_b_opened_warning(config_path): logging.warning(warning)
     config = parse_fine_rank_multitask_config(load_yaml_config(config_path), config_path, stage=args.stage)
     print(json.dumps(run_fine_rank_multitask(config, stage=args.stage), indent=2, sort_keys=True))
 

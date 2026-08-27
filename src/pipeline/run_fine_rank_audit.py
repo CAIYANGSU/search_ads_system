@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from search_ads_system.common.config import load_yaml_config
+from search_ads_system.evaluation.final_holdout import future_b_opened_warning
 from search_ads_system.ranking.fine_rank_multitask import parse_fine_rank_multitask_config
 from search_ads_system.ranking.fine_rank_multitask_audit import (
     parse_fine_rank_multitask_audit_config, run_fine_rank_multitask_audit,
@@ -25,7 +26,9 @@ def main() -> None:
     parser.add_argument("--stage", choices=("sanity", "all"), required=True)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    path = args.config.resolve(); raw = load_yaml_config(path)
+    path = args.config.resolve()
+    if warning := future_b_opened_warning(path): logging.warning(warning)
+    raw = load_yaml_config(path)
     model_config = parse_fine_rank_multitask_config(raw, path, stage=args.stage)
     audit_config = parse_fine_rank_multitask_audit_config(raw, path, stage=args.stage)
     # Audit batch sizing and epoch policy are independent from the selected

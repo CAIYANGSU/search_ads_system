@@ -4,6 +4,7 @@ import argparse, json, logging, sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]; sys.path.insert(0,str(ROOT/"src"))
 from search_ads_system.common.config import load_yaml_config
+from search_ads_system.evaluation.final_holdout import future_b_opened_warning
 from search_ads_system.evaluation.temporal import build_temporal_split, diagnose_temporal_recall_sources, diagnose_two_tower_cold_start, evaluate_recall_file, parse_temporal_config, run_temporal_coarse, temporal_pipeline_diagnostics
 from search_ads_system.recall.itemcf_recall import ItemCFRecallConfig, generate_itemcf_candidates, load_interactions as load_itemcf, write_candidates as write_itemcf
 from search_ads_system.recall.popularity_recall import PopularityRecallConfig, generate_popularity_candidates, write_candidates as write_popularity
@@ -94,7 +95,9 @@ def _content_two_tower(raw, temporal, *, sanity=False):
 def main()->None:
     parser=argparse.ArgumentParser(); parser.add_argument("--config",type=Path,default=ROOT/"config.yaml"); parser.add_argument("--stage",choices=("split","itemcf","two_tower","popularity","rrf","evaluate_recall","fusion_sweep","two_tower_content_sanity","two_tower_content","coarse","funnel","all"),default="all"); args=parser.parse_args()
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    path=args.config.resolve(); raw=load_yaml_config(path); temporal=parse_temporal_config(raw,path); result={}
+    path=args.config.resolve()
+    if warning := future_b_opened_warning(path): logging.warning(warning)
+    raw=load_yaml_config(path); temporal=parse_temporal_config(raw,path); result={}
     if args.stage in ('split','all'): result['split']=build_temporal_split(temporal)
     if args.stage in ('itemcf','two_tower','popularity','rrf','funnel','all'):
         if not (temporal.output_dir/'split'/'metadata.json').exists(): build_temporal_split(temporal)
