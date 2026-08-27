@@ -17,7 +17,7 @@ from search_ads_system.evaluation.final_holdout import run_final_holdout
 def main() -> None:
     parser = argparse.ArgumentParser(description="Frozen final Future-B holdout evaluation")
     parser.add_argument("--config", type=Path, default=ROOT / "config.yaml")
-    parser.add_argument("--stage", choices=("sanity", "all"), required=True)
+    parser.add_argument("--stage", choices=("sanity", "render", "all"), required=True)
     args = parser.parse_args(); path = args.config.resolve()
     print(json.dumps(run_final_holdout(load_yaml_config(path), path, stage=args.stage), indent=2, sort_keys=True))
 

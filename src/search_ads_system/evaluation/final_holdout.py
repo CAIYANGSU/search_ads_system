@@ -85,10 +85,13 @@ def validate_frozen_artifacts(raw: Mapping[str, Any], config_path: Path) -> dict
 
 
 def run_final_holdout(raw: Mapping[str, Any], config_path: Path, *, stage: str) -> dict[str, Any]:
-    final = parse_final_holdout_config(raw, config_path); frozen = validate_frozen_artifacts(raw, config_path)
+    final = parse_final_holdout_config(raw, config_path)
+    if stage == "render":
+        return render_existing_final_holdout(final)
+    frozen = validate_frozen_artifacts(raw, config_path)
     if stage == "sanity":
         return {"stage": "sanity", "frozen_artifacts": frozen, "future_b_read": False, "schema": _schema_stub()}
-    if stage != "all": raise ValueError("final holdout stage must be sanity or all")
+    if stage != "all": raise ValueError("final holdout stage must be sanity, render, or all")
     final.output_dir.mkdir(parents=True, exist_ok=True)
     if marker_path(final).exists():
         raise RuntimeError(f"Future-B has already been opened ({marker_path(final)}); final holdout evaluation is one-way and cannot be rerun.")
@@ -101,6 +104,8 @@ def run_final_holdout(raw: Mapping[str, Any], config_path: Path, *, stage: str) 
         "frozen_declaration": {"model_and_policy_frozen_before_future_b": True, "future_b_used_for_training": False, "future_b_used_for_model_selection": False, "future_b_used_for_policy_selection": False, "future_b_used_for_final_evaluation": True},
         "future_b_read_for_policy_selection": False,
         "future_b_read_for_search_conversion_simulation": True,
+        "future_b_reread": False,
+        "reused_existing_final_metrics": False,
         "data_contracts": {"cross_dataset_join": False, "attribution": "impression-level; synthetic offline auction/bidding only", "search_conversion": "clicked-interaction value selection; not impression auction"},
         "frozen_artifacts": frozen, "attribution_final_holdout": attribution, "search_conversion_final_holdout": search, "future_a_vs_future_b": drift,
         "limitations": _limitations(), "final_conclusion": "Future-B is a final time-out holdout. Results are descriptive offline evaluation, not an online A/B test.",
@@ -109,6 +114,29 @@ def run_final_holdout(raw: Mapping[str, Any], config_path: Path, *, stage: str) 
     json_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"); markdown_path.write_text(_markdown(report), encoding="utf-8")
     pd.DataFrame(drift["rows"]).to_csv(csv_path, index=False)
     return {"report_path": str(json_path), "markdown_path": str(markdown_path), "comparison_path": str(csv_path), "future_b_read": True}
+
+
+def render_existing_final_holdout(config: FinalHoldoutConfig) -> dict[str, Any]:
+    """Correct report-layer interpretation from the existing final JSON only."""
+    json_path = config.output_dir / "final_holdout_metrics.json"
+    markdown_path = config.output_dir / "final_holdout_metrics.md"
+    csv_path = config.output_dir / "future_a_vs_future_b.csv"
+    if not marker_path(config).is_file():
+        raise FileNotFoundError(f"Final-holdout marker required for render-only mode: {marker_path(config)}")
+    if not json_path.is_file():
+        raise FileNotFoundError(f"Existing final metrics required for render-only mode: {json_path}")
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+    drift = report.get("future_a_vs_future_b")
+    if not isinstance(drift, Mapping) or not isinstance(drift.get("rows"), list):
+        raise ValueError("Existing final metrics lacks future_a_vs_future_b.rows")
+    rows = [_delta(row.get("metric"), row.get("future_a"), row.get("future_b"), config) for row in drift["rows"]]
+    report["future_a_vs_future_b"] = {**drift, "rows": rows, "thresholds": {"moderate": config.moderate_threshold, "large": config.large_threshold}}
+    report["future_b_reread"] = False
+    report["reused_existing_final_metrics"] = True
+    json_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    markdown_path.write_text(_markdown(report), encoding="utf-8")
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    return {"report_path": str(json_path), "markdown_path": str(markdown_path), "comparison_path": str(csv_path), "future_b_read": False, "future_b_reread": False, "reused_existing_final_metrics": True}
 
 
 def _evaluate_attribution_future_b(raw: Mapping[str, Any], config_path: Path) -> dict[str, Any]:
@@ -202,9 +230,26 @@ def _dig(value: Mapping[str, Any], *keys: str) -> Any:
 
 
 def _delta(name: str, before: Any, after: Any, config: FinalHoldoutConfig) -> dict[str, Any]:
-    if before is None or after is None: return {"metric": name, "future_a": before, "future_b": after, "absolute_delta": None, "relative_delta": None, "interpretation": "unavailable"}
-    delta = float(after) - float(before); magnitude = abs(delta); interpretation = "stable" if magnitude < config.moderate_threshold else "moderate degradation" if magnitude < config.large_threshold else "large degradation"
-    return {"metric": name, "future_a": float(before), "future_b": float(after), "absolute_delta": delta, "relative_delta": delta / abs(float(before)) if before else None, "interpretation": interpretation}
+    direction = _metric_direction(name)
+    if before is None or after is None:
+        return {"metric": name, "direction": direction, "future_a": before, "future_b": after, "absolute_delta": None, "relative_delta": None, "interpretation": "unavailable"}
+    delta = float(after) - float(before)
+    relative = delta / abs(float(before)) if before else None
+    if relative is None:
+        interpretation = "stable" if delta == 0 else "unavailable"
+    else:
+        directional_change = relative if direction == "higher_is_better" else -relative
+        interpretation = "improved" if directional_change > 0 else "stable" if directional_change >= -config.moderate_threshold else "moderate degradation" if directional_change >= -config.large_threshold else "large degradation"
+    return {"metric": name, "direction": direction, "future_a": float(before), "future_b": float(after), "absolute_delta": delta, "relative_delta": relative, "interpretation": interpretation}
+
+
+def _metric_direction(name: Any) -> str:
+    metric = str(name)
+    if metric.endswith(("_pr_auc", "_roc_auc", "_value_capture_rate", "_value_per_click_lift")):
+        return "higher_is_better"
+    if metric.endswith(("_logloss", "_ece", "_brier_score", "_mae", "_rmse", "_rmsle", "_cpa_proxy")):
+        return "lower_is_better"
+    raise ValueError(f"No direction contract for final-holdout metric: {metric}")
 
 
 def _write_opened_marker(config: FinalHoldoutConfig, frozen: Mapping[str, str], raw: Mapping[str, Any], config_path: Path) -> None:
@@ -224,11 +269,10 @@ def _write_opened_marker(config: FinalHoldoutConfig, frozen: Mapping[str, str], 
     marker_path(config).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _schema_stub() -> dict[str, Any]: return {"final_holdout_metrics": ["frozen_declaration", "future_b_read_for_policy_selection", "future_b_read_for_search_conversion_simulation", "data_contracts", "frozen_artifacts", "attribution_final_holdout", "search_conversion_final_holdout", "future_a_vs_future_b", "limitations", "final_conclusion"]}
+def _schema_stub() -> dict[str, Any]: return {"final_holdout_metrics": ["frozen_declaration", "future_b_read_for_policy_selection", "future_b_read_for_search_conversion_simulation", "future_b_reread", "reused_existing_final_metrics", "data_contracts", "frozen_artifacts", "attribution_final_holdout", "search_conversion_final_holdout", "future_a_vs_future_b", "limitations", "final_conclusion"]}
 def _limitations() -> list[str]: return ["The Criteo datasets have no reliable ID mapping and were never joined.", "Attribution auction/bidding is synthetic offline simulation, not online ROI.", "Search Conversion contains clicked interactions, not a complete impression auction.", "Fine Rank high scores reflect strong data separability; its formal audit found no direct leakage.", "Unseen-user temporal coverage is limited.", "Future-B is a final holdout, not a real online A/B test."]
 def _markdown(report: Mapping[str, Any]) -> str:
-    rows = pd.DataFrame(report["future_a_vs_future_b"]["rows"])
-    table = rows.to_markdown(index=False) if not rows.empty else "No comparable metrics were available."
+    table = _markdown_table(report["future_a_vs_future_b"]["rows"])
     attribution = report["attribution_final_holdout"]
     search = report["search_conversion_final_holdout"]
     return (
@@ -254,3 +298,18 @@ def _markdown(report: Mapping[str, Any]) -> str:
         + report["final_conclusion"]
         + "\n"
     )
+
+
+def _markdown_table(rows: list[Mapping[str, Any]]) -> str:
+    """Render the small report table without requiring the optional tabulate package."""
+    if not rows:
+        return "No comparable metrics were available."
+    columns = ["metric", "direction", "future_a", "future_b", "absolute_delta", "relative_delta", "interpretation"]
+    header = "| " + " | ".join(columns) + " |"
+    separator = "| " + " | ".join("---" for _ in columns) + " |"
+    def display(value: Any) -> str:
+        if value is None: return ""
+        if isinstance(value, float): return f"{value:.8g}"
+        return str(value).replace("|", "\\|").replace("\n", " ")
+    body = ["| " + " | ".join(display(row.get(column)) for column in columns) + " |" for row in rows]
+    return "\n".join([header, separator, *body])

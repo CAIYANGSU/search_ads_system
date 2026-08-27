@@ -44,8 +44,35 @@ def test_frozen_checkpoint_is_required_without_retraining(tmp_path: Path) -> Non
 
 
 def test_delta_and_marker_contract(tmp_path: Path) -> None:
-    row = _delta("metric", .5, .4, FinalHoldoutConfig(tmp_path, .05, .15))
-    assert row["absolute_delta"] == pytest.approx(-.1) and row["interpretation"] == "moderate degradation"
+    config = FinalHoldoutConfig(tmp_path, .05, .15)
+    assert _delta("search_value_mae", 93.5175, 89.1515, config)["interpretation"] == "improved"
+    assert _delta("search_value_rmse", 234.9550, 226.5022, config)["interpretation"] == "improved"
+    assert _delta("search_top_10pct_value_per_click_lift", 8.4726, 9.4294, config)["interpretation"] == "improved"
+    assert _delta("attribution_ctr_pr_auc", .5, .45, config)["interpretation"] == "moderate degradation"
+    assert _delta("attribution_ctr_logloss", .5, .55, config)["interpretation"] == "moderate degradation"
+
+
+def test_render_reuses_only_existing_final_metrics_without_future_b(tmp_path: Path) -> None:
+    raw, config_path = _raw(tmp_path)
+    config = FinalHoldoutConfig(tmp_path / "final", .05, .15)
+    config.output_dir.mkdir()
+    marker_path(config).write_text("{}")
+    (config.output_dir / "final_holdout_metrics.json").write_text(json.dumps({
+        "future_a_vs_future_b": {"rows": [
+            {"metric": "search_value_mae", "future_a": 93.5175, "future_b": 89.1515},
+            {"metric": "search_top_10pct_value_per_click_lift", "future_a": 8.4726, "future_b": 9.4294},
+        ]},
+        "attribution_final_holdout": {"rows": 1},
+        "search_conversion_final_holdout": {"rows": 1},
+        "limitations": [],
+        "final_conclusion": "final",
+    }))
+    result = run_final_holdout(raw, config_path, stage="render")
+    rendered = json.loads(Path(result["report_path"]).read_text())
+    assert result["future_b_read"] is False
+    assert rendered["future_b_reread"] is False and rendered["reused_existing_final_metrics"] is True
+    assert [row["interpretation"] for row in rendered["future_a_vs_future_b"]["rows"]] == ["improved", "improved"]
+    assert "| metric | direction |" in Path(result["markdown_path"]).read_text()
 
 
 def test_all_is_the_only_stage_that_opens_future_b_and_writes_final_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
