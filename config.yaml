@@ -408,6 +408,23 @@ business_simulation:
   pacing_min: 0.5
   pacing_max: 2.0
   budget_levels: [0.25, 0.50, 0.75, 1.0]
+  target_cpa:
+    enabled: true
+    target_cpa_values: [0.5, 1.0, 2.0]
+    default_target_cpa: 1.0
+    bid_scale: 1.0
+  value_based_bidding:
+    enabled: true
+    target_roas_values: [1.0, 2.0, 4.0]
+    default_target_roas: 2.0
+    bid_scale: 1.0
+    # Null means unavailable.  Do not point this to labels, actual conversion
+    # value, or a Search Conversion field: no legal cross-dataset mapping exists.
+    prediction_column: null
+  pacing:
+    enabled: true
+    comparison_policies: [calibrated_ctcvr_scaled, target_cpa_bidding]
+    trajectory_buckets: 10
   max_rows: null
   # Optional standalone clicked-interaction predictions. Expected columns:
   # pCVR_clicked, predicted_conditional_value, conversion_value_eur.

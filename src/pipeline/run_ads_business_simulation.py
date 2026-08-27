@@ -30,6 +30,7 @@ def _options(raw: Mapping[str, Any], config_path: Path, stage: str) -> tuple[dic
 
 
 def _read_parts(path: Path, limit: int | None) -> pd.DataFrame:
+    _reject_future_b_path(path)
     files = sorted(path.glob("part-*.csv")) if path.is_dir() else [path]
     if not files or not all(item.is_file() for item in files): raise FileNotFoundError(f"Simulation input artifacts not found: {path}")
     pieces: list[pd.DataFrame] = []; rows = 0
@@ -47,6 +48,8 @@ def _load_attribution(raw: Mapping[str, Any], path: Path, stage: str, limit: int
     calibration = parse_attribution_calibration_config(raw, path)
     suffix = "sanity" if stage == "sanity" else ""
     prediction_dir = calibration.output_dir / "predictions" / suffix / "calibration_eval" if suffix else calibration.output_dir / "predictions" / "calibration_eval"
+    _reject_future_b_path(prediction_dir)
+    _reject_future_b_path(calibration.esmm.future_a_path)
     frame = _read_parts(prediction_dir, limit)
     # This is an Attribution-internal event_id enrichment, never a join to
     # Search Conversion. It recovers accounting cost/campaign when available.
@@ -58,6 +61,7 @@ def _load_attribution(raw: Mapping[str, Any], path: Path, stage: str, limit: int
 
 
 def _read_attribution_fields(path: Path, wanted: set[str], limit: int | None) -> pd.DataFrame:
+    _reject_future_b_path(path)
     pieces: list[pd.DataFrame] = []; found = 0
     for file in sorted(path.glob("part-*.csv")):
         for frame in pd.read_csv(file, usecols=lambda col: col in {"event_id", "campaign", "cost"}, chunksize=200_000, low_memory=False):
@@ -66,6 +70,13 @@ def _read_attribution_fields(path: Path, wanted: set[str], limit: int | None) ->
             if limit is not None and found >= limit: break
         if limit is not None and found >= limit: break
     return pd.concat(pieces, ignore_index=True).drop_duplicates("event_id") if pieces else pd.DataFrame(columns=["event_id", "campaign", "cost"])
+
+
+def _reject_future_b_path(path: Path) -> None:
+    """Fail closed: this frozen policy experiment may only consume Future-A artifacts."""
+    normalized = str(path).replace("\\", "/").lower()
+    if "future_b" in normalized or "future-b" in normalized:
+        raise RuntimeError(f"Future-B input is forbidden for bidding experiments: {path}")
 
 
 def _apply_selected_calibrators(frame: pd.DataFrame, calibration: Any, suffix: str) -> dict[str, Any]:
@@ -93,7 +104,15 @@ def main() -> None:
     parser.add_argument("--stage", choices=("sanity", "all"), required=True)
     args = parser.parse_args(); config_path = args.config.resolve(); raw = load_yaml_config(config_path); options, output = _options(raw, config_path, args.stage)
     if warning := future_b_opened_warning(config_path): print(f"WARNING: {warning}", file=sys.stderr)
-    simulation = SimulationConfig(seed=int(options.get("seed", 2026)), candidates_per_auction=int(options.get("candidates_per_auction", 5)), base_bid=float(options.get("base_bid", 1.0)), mechanism=str(options.get("mechanism", "second_price")), total_budget=float(options.get("total_budget", 1000.0)), pacing_min=float(options.get("pacing_min", .5)), pacing_max=float(options.get("pacing_max", 2.0)), budget_levels=tuple(float(value) for value in options.get("budget_levels", (.25, .5, .75, 1.0))))
+    target_cpa = _mapping_option(options, "target_cpa")
+    value_bidding = _mapping_option(options, "value_based_bidding")
+    pacing = _mapping_option(options, "pacing")
+    simulation = SimulationConfig(
+        seed=int(options.get("seed", 2026)), candidates_per_auction=int(options.get("candidates_per_auction", 5)), base_bid=float(options.get("base_bid", 1.0)), mechanism=str(options.get("mechanism", "second_price")), total_budget=float(options.get("total_budget", 1000.0)), pacing_min=float(options.get("pacing_min", .5)), pacing_max=float(options.get("pacing_max", 2.0)), budget_levels=tuple(float(value) for value in options.get("budget_levels", (.25, .5, .75, 1.0))),
+        target_cpa_enabled=bool(target_cpa.get("enabled", True)), target_cpa_values=tuple(float(value) for value in target_cpa.get("target_cpa_values", (.5, 1., 2.))), default_target_cpa=float(target_cpa.get("default_target_cpa", 1.)), target_cpa_bid_scale=float(target_cpa.get("bid_scale", 1.)),
+        value_based_enabled=bool(value_bidding.get("enabled", True)), target_roas_values=tuple(float(value) for value in value_bidding.get("target_roas_values", (1., 2., 4.))), default_target_roas=float(value_bidding.get("default_target_roas", 2.)), value_based_bid_scale=float(value_bidding.get("bid_scale", 1.)), value_prediction_column=value_bidding.get("prediction_column"),
+        pacing_enabled=bool(pacing.get("enabled", True)), pacing_comparison_policies=tuple(str(value) for value in pacing.get("comparison_policies", ("calibrated_ctcvr_scaled", "target_cpa_bidding"))), trajectory_buckets=int(pacing.get("trajectory_buckets", 10)),
+    )
     limit = options.get("max_rows"); limit = None if limit is None else int(limit)
     attribution, calibrated = _load_attribution(raw, config_path, args.stage, limit)
     attribution_report, policy, curve = simulate_attribution(attribution, config=simulation, calibrated_available=calibrated)
@@ -103,10 +122,14 @@ def main() -> None:
         fractions = tuple(float(value) for value in options.get("search_selection_fractions", (.10, .25, .50, .75, 1.0)))
         search_report, search_policy, search_deciles = simulate_search_conversion(search_frame, config=simulation, selection_fractions=fractions)
     output.joinpath("metrics").mkdir(parents=True, exist_ok=True); output.joinpath("tables").mkdir(parents=True, exist_ok=True)
-    report = {"simulation_semantics": "synthetic_offline_simulation", **future_b_isolation_contract(), "cross_dataset_join": "not performed; Attribution and Search Conversion are simulated independently", "attribution": attribution_report, "search_conversion": search_report}
+    report = {"simulation_semantics": "synthetic_offline_simulation", **future_b_isolation_contract(), "cross_dataset_join": False, "cross_dataset_join_note": "Attribution and Search Conversion are simulated independently", "attribution": attribution_report, "search_conversion": search_report, "conclusion": _conclusion(attribution_report)}
     (output / "metrics" / "auction_metrics.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     (output / "metrics" / "auction_metrics.md").write_text(_markdown(report), encoding="utf-8")
     policy.to_csv(output / "tables" / "policy_comparison.csv", index=False); curve.to_csv(output / "tables" / "budget_curve.csv", index=False)
+    (output / "metrics" / "bidding_policy_comparison.json").write_text(json.dumps(attribution_report["policy_comparison"], indent=2, sort_keys=True), encoding="utf-8")
+    (output / "metrics" / "pacing_comparison.json").write_text(json.dumps(attribution_report["pacing_comparison"], indent=2, sort_keys=True), encoding="utf-8")
+    _spend_trajectory_frame(attribution_report).to_csv(output / "metrics" / "spend_trajectory.csv", index=False)
+    (output / "metrics" / "bidding_summary.md").write_text(_bidding_summary(report), encoding="utf-8")
     pd.DataFrame([report["attribution"]["calibration_business_impact"]]).to_csv(output / "tables" / "calibration_business_impact.csv", index=False)
     if search_path:
         search_policy.to_csv(output / "tables" / "search_conversion_value_policy_comparison.csv", index=False)
@@ -114,8 +137,58 @@ def main() -> None:
     print(json.dumps({"metrics": str(output / "metrics" / "auction_metrics.json"), "future_b_read_for_policy_selection": False}, indent=2))
 
 
+def _mapping_option(options: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    value = options.get(name, {})
+    if not isinstance(value, Mapping):
+        raise ValueError(f"business_simulation.{name} must be a mapping")
+    return value
+
+
+def _spend_trajectory_frame(attribution: Mapping[str, Any]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for comparison in attribution.get("policy_comparison", []):
+        for bucket in comparison.get("spend_trajectory", []):
+            rows.append({"policy_name": comparison["policy_name"], "bid_semantics": comparison["bid_semantics"], "quality_score": comparison["quality_score"], "budget": comparison["budget"], "pacing_mode": comparison["pacing_mode"], **bucket})
+    return pd.DataFrame(rows)
+
+
+def _conclusion(attribution: Mapping[str, Any]) -> list[str]:
+    conclusion = ["All findings are descriptive synthetic offline simulation evidence, not online ROI or production-bidding claims."]
+    impact = attribution["calibration_business_impact"]
+    if impact.get("available"):
+        conclusion.append(f"Calibration changed {impact['winner_change_count']} synthetic 100% budget winners (rate={impact['winner_change_rate']:.6g}).")
+    target = attribution["target_cpa_sensitivity"]
+    if target.get("available"):
+        conclusion.append("Target CPA bidding provides explicit synthetic economic bid semantics; sensitivity is reported without label-based tuning.")
+    value = attribution["value_based_bidding"]
+    if not value.get("available"):
+        conclusion.append(f"Value-based bidding is unavailable: {value['reason']}")
+    pacing = attribution["pacing_comparison"]
+    if pacing.get("available"):
+        conclusion.append("No-pacing and budget-aware pacing use identical deterministic auction order, seed, predictions, and budgets; results are reported rather than optimized.")
+    return conclusion
+
+
+def _bidding_summary(report: Mapping[str, Any]) -> str:
+    attribution = report["attribution"]
+    target = attribution["target_cpa_sensitivity"]
+    value = attribution["value_based_bidding"]
+    lines = [
+        "# Synthetic Attribution bidding summary", "",
+        "## Experiment contract", "",
+        "Attribution is impression-level modeling plus deterministic synthetic offline auctions. Search Conversion is clicked-interaction selection only; `cross_dataset_join = false`.",
+        "", "## Available policies", "",
+    ]
+    lines.extend(f"- {name}: {'available' if value.get('available') else 'unavailable'}" for name, value in attribution["policies"].items())
+    lines.extend(("", "## Target CPA sensitivity", "", f"- available: {target.get('available')}", f"- formula: {target.get('formula', target.get('reason'))}"))
+    lines.extend(("", "## Value-based bidding availability", "", f"- available: {value.get('available')}", f"- reason: {value.get('reason', 'prediction-only expected-value bid')}", "- real_online_roas_available: false"))
+    lines.extend(("", "## Calibration impact", "", f"- winner changes: {attribution['calibration_business_impact'].get('winner_change_count')}", "", "## Pacing comparison", "", attribution["pacing_comparison"]["definition"], "", "## Budget sensitivity", "", "Budget levels and no-pacing versus budget-aware pacing metrics are written to policy comparison and spend trajectory artifacts.", "", "## Limitations", "", "- No Future-B data was read for policy selection or bidding experiments.", "- No real advertiser bids, real ROAS, or online ROI are available.", "", "## Evidence-based conclusion", ""))
+    lines.extend(f"- {item}" for item in report["conclusion"])
+    return "\n".join(lines) + "\n"
+
+
 def _markdown(report: Mapping[str, Any]) -> str:
-    lines = ["# Advertising value / auction / bidding simulation", "", "All bid, grouping, auction, payment, budget, pacing, and efficiency results are synthetic offline simulation. They are not real advertiser bids, real auction outcomes, or online ROI.", "", "- Future-B read for policy selection: `false`.", "- Attribution and Search Conversion were not joined.", "", "## Attribution policies", ""]
+    lines = ["# Advertising value / auction / bidding simulation", "", "All bid, grouping, auction, payment, budget, pacing, and efficiency results are synthetic offline simulation. They are not real advertiser bids, real auction outcomes, or online ROI.", "", "- Future-B read for policy selection: `false`.", "- Future-B read for bidding experiment: `false`.", "- Attribution and Search Conversion were not joined.", "", "## Attribution policies", ""]
     for name, value in report["attribution"]["policies"].items():
         if not value.get("available", True):
             lines.append(f"- {name}: unavailable")

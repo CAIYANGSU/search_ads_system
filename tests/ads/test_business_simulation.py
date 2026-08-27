@@ -6,10 +6,10 @@ import sys
 import yaml
 
 from search_ads_system.ads.auction import group_candidates, run_auction
-from search_ads_system.ads.bidding import synthetic_bid
+from search_ads_system.ads.bidding import synthetic_bid, target_cpa_bid, value_based_bid
 from search_ads_system.ads.pacing import pacing_multipliers
 from search_ads_system.ads.simulator import SimulationConfig, future_b_isolation_contract, simulate_attribution, simulate_search_conversion
-from pipeline.run_ads_business_simulation import main as business_main
+from pipeline.run_ads_business_simulation import _reject_future_b_path, main as business_main
 
 
 def test_first_and_second_price_clearing_and_winner_ranking() -> None:
@@ -28,6 +28,14 @@ def test_grouping_seed_budget_and_pacing_are_deterministic() -> None:
     assert np.all((pacing_multipliers(np.array([1., 1.]), budget=2, minimum=.5, maximum=1.5) >= .5) & (pacing_multipliers(np.array([1., 1.]), budget=2, minimum=.5, maximum=1.5) <= 1.5))
 
 
+def test_target_cpa_and_value_bid_monotonicity() -> None:
+    probability = np.array([.1, .2])
+    assert np.all(target_cpa_bid(calibrated_pctcvr=probability, target_cpa=2., bid_scale=1.) >= target_cpa_bid(calibrated_pctcvr=probability, target_cpa=1., bid_scale=1.))
+    assert target_cpa_bid(calibrated_pctcvr=np.array([.2]), target_cpa=1., bid_scale=1.).item() >= target_cpa_bid(calibrated_pctcvr=np.array([.1]), target_cpa=1., bid_scale=1.).item()
+    assert value_based_bid(calibrated_pctcvr=np.array([.2]), predicted_conditional_conversion_value=np.array([10.]), target_roas=2., bid_scale=1.).item() >= value_based_bid(calibrated_pctcvr=np.array([.2]), predicted_conditional_conversion_value=np.array([5.]), target_roas=2., bid_scale=1.).item()
+    assert value_based_bid(calibrated_pctcvr=np.array([.2]), predicted_conditional_conversion_value=np.array([10.]), target_roas=4., bid_scale=1.).item() <= value_based_bid(calibrated_pctcvr=np.array([.2]), predicted_conditional_conversion_value=np.array([10.]), target_roas=2., bid_scale=1.).item()
+
+
 def test_raw_calibrated_and_search_value_paths_stay_independent() -> None:
     frame = pd.DataFrame({"raw_pctr": [.1,.2,.3,.4], "raw_pctcvr": [.01,.04,.09,.16], "calibrated_pctr": [.15,.2,.25,.3], "calibrated_pctcvr": [.02,.03,.08,.1], "click": [0,1,0,1], "conversion": [0,0,0,1], "cost": [1.,1.,1.,1.]})
     report, _, _ = simulate_attribution(frame, config=SimulationConfig(candidates_per_auction=2, total_budget=10), calibrated_available=True)
@@ -40,6 +48,31 @@ def test_raw_calibrated_and_search_value_paths_stay_independent() -> None:
     assert len(deciles) == 10
     assert synthetic_bid("fixed_bid", base_bid=2.0, pctr=np.array([.1,.2])).tolist() == [2.0, 2.0]
     assert future_b_isolation_contract()["future_b_read_for_policy_selection"] is False
+    assert report["policies"]["target_cpa_bidding"]["available"] is True
+    assert report["value_based_bidding"]["available"] is False
+    assert report["cross_dataset_join"] is False
+    for policy in report["policies"].values():
+        if policy.get("available"):
+            assert policy["simulated_spend"] <= 10 + 1e-12
+
+
+def test_pacing_is_deterministic_and_shares_auction_order() -> None:
+    frame = pd.DataFrame({"raw_pctr": [.1,.2,.3,.4,.5,.6], "raw_pctcvr": [.01,.02,.03,.04,.05,.06], "calibrated_pctr": [.1,.2,.3,.4,.5,.6], "calibrated_pctcvr": [.01,.02,.03,.04,.05,.06], "click": [0,1,0,1,0,1], "conversion": [0,0,0,1,0,1], "cost": [1.] * 6})
+    config = SimulationConfig(candidates_per_auction=2, total_budget=.05, budget_levels=(.25,.5,.75,1.), seed=11)
+    first, _, first_curve = simulate_attribution(frame, config=config, calibrated_available=True)
+    second, _, second_curve = simulate_attribution(frame, config=config, calibrated_available=True)
+    assert first["pacing_comparison"] == second["pacing_comparison"]
+    selected = first_curve.loc[(first_curve.policy_name == "calibrated_ctcvr_scaled") & (first_curve.budget_level == 1.0)]
+    orders = [tuple(group.auction_order) for _, group in selected.groupby("pacing_mode")]
+    assert len(set(orders)) == 1
+
+
+def test_future_b_path_is_rejected_and_value_labels_cannot_enable_bidding(tmp_path) -> None:
+    with np.testing.assert_raises(RuntimeError):
+        _reject_future_b_path(tmp_path / "split" / "future_b" / "part-00000.csv")
+    frame = pd.DataFrame({"raw_pctr": [.1,.2], "raw_pctcvr": [.01,.02], "calibrated_pctr": [.1,.2], "calibrated_pctcvr": [.01,.02], "click": [0,1], "conversion": [0,1], "conversion_value_eur": [0., 100.]})
+    report, _, _ = simulate_attribution(frame, config=SimulationConfig(candidates_per_auction=2, value_prediction_column="conversion_value_eur"), calibrated_available=True)
+    assert report["value_based_bidding"]["available"] is False
 
 
 def test_cli_runs_full_synthetic_sanity_without_future_b(tmp_path, monkeypatch) -> None:
@@ -57,6 +90,9 @@ def test_cli_runs_full_synthetic_sanity_without_future_b(tmp_path, monkeypatch) 
     business_main()
     report = yaml.safe_load((output / "metrics" / "auction_metrics.json").read_text())
     assert report["future_b_read_for_policy_selection"] is False
+    assert report["future_b_read_for_bidding_experiment"] is False
     assert (output / "tables" / "budget_curve.csv").is_file()
     assert report["search_conversion"]["available"] is True
     assert (output / "tables" / "search_conversion_value_policy_comparison.csv").is_file()
+    for name in ("bidding_policy_comparison.json", "pacing_comparison.json", "spend_trajectory.csv", "bidding_summary.md"):
+        assert (output / "metrics" / name).is_file()
