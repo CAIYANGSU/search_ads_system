@@ -39,6 +39,7 @@ LOGGER = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class FineRankAuditConfig:
     output_path: Path
+    full_reference_path: Path | None = None
     calibration_bins: int = 20
     output_chunk_size: int = 500_000
     ablation_train_rows: int = 100_000
@@ -50,12 +51,25 @@ class FineRankAuditConfig:
 
 def parse_fine_rank_audit_config(raw_config: Mapping[str, Any], config_path: Path, fine_rank: FineRankConfig) -> FineRankAuditConfig:
     options = raw_config.get("fine_rank", {})
-    audit = options.get("audit", {}) if isinstance(options, Mapping) else {}
+    if not isinstance(options, Mapping):
+        raise ValueError("fine_rank must be a mapping")
+    temporal = raw_config.get("temporal", {})
+    temporal_options = temporal.get("fine_rank", {}) if isinstance(temporal, Mapping) else {}
+    if fine_rank.mode == "temporal" and not isinstance(temporal_options, Mapping):
+        raise ValueError("temporal.fine_rank must be a mapping")
+    # Do not inherit a full-mode audit output path in temporal mode: every
+    # temporal report must remain below outputs/temporal.
+    effective = temporal_options if fine_rank.mode == "temporal" else options
+    audit = effective.get("audit", {}) if isinstance(effective, Mapping) else {}
     if not isinstance(audit, Mapping):
         raise ValueError("fine_rank.audit must be a mapping")
     root = config_path.parent.resolve()
+    default_output = fine_rank.metrics_path.parent / "fine_rank_audit.json" if fine_rank.mode == "temporal" else fine_rank.output_path.parent / "fine_rank_audit.json"
+    full_audit = options.get("audit", {})
+    full_reference = resolve_path(str(full_audit.get("output_path", "outputs/metrics/fine_rank_audit.json")), root) if isinstance(full_audit, Mapping) else None
     config = FineRankAuditConfig(
-        output_path=resolve_path(str(audit.get("output_path", fine_rank.output_path.parent / "fine_rank_audit.json")), root),
+        output_path=resolve_path(str(audit.get("output_path", default_output)), root),
+        full_reference_path=full_reference if fine_rank.mode == "temporal" else None,
         calibration_bins=int(audit.get("calibration_bins", 20)),
         output_chunk_size=int(audit.get("output_chunk_size", 500_000)),
         ablation_train_rows=int(audit.get("ablation_train_rows", 100_000)),
@@ -66,6 +80,8 @@ def parse_fine_rank_audit_config(raw_config: Mapping[str, Any], config_path: Pat
     )
     if config.calibration_bins < 2 or config.output_chunk_size <= 0 or min(config.ablation_train_rows, config.ablation_validation_rows, config.ablation_epochs, config.ablation_batch_size) <= 0:
         raise ValueError("fine_rank.audit numeric configuration is invalid")
+    if fine_rank.mode == "temporal" and "temporal" not in config.output_path.resolve().parts:
+        raise ValueError("Temporal fine-rank audit output must be isolated below outputs/temporal")
     return config
 
 
@@ -113,8 +129,9 @@ def run_fine_rank_audit(config: FineRankConfig, audit_config: FineRankAuditConfi
         audit_config.output_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
         markdown_path = audit_config.output_path.with_suffix(".md")
         markdown_path.write_text(_render_markdown(report), encoding="utf-8")
+        comparison_path = _write_full_vs_temporal_report(report, audit_config) if config.mode == "temporal" else None
         LOGGER.info("Fine-rank audit written to %s and %s", audit_config.output_path, markdown_path)
-        return {"report_path": str(audit_config.output_path), "markdown_path": str(markdown_path), "classification_metrics": report["classification_metrics"], "overlap": overlap, "ablation_ran": include_ablation}
+        return {"report_path": str(audit_config.output_path), "markdown_path": str(markdown_path), "comparison_path": str(comparison_path) if comparison_path else None, "classification_metrics": report["classification_metrics"], "overlap": overlap, "ablation_ran": include_ablation}
     finally:
         connection.close()
         database_path.unlink(missing_ok=True)
@@ -274,7 +291,12 @@ def _leakage_audit(config: FineRankConfig) -> dict[str, Any]:
         assert_no_fine_rank_leakage(feature_columns); passed = True; error = None
     except ValueError as exception:
         passed = False; error = str(exception)
-    return {
+    temporal_contract: Mapping[str, Any] | None = None
+    if config.mode == "temporal":
+        metadata_path = dataset_spec(config).metadata_path
+        if metadata_path.is_file():
+            temporal_contract = json.loads(metadata_path.read_text(encoding="utf-8")).get("temporal_feature_semantics")
+    result = {
         "passed_static_feature_guard": passed,
         "guard_error": error,
         "dense_features": list(DENSE_FEATURES),
@@ -282,13 +304,18 @@ def _leakage_audit(config: FineRankConfig) -> dict[str, Any]:
         "blocked_direct_columns": sorted(LEAKAGE_COLUMNS),
         "conversion_derived_features_in_model": [],
         "feature_provenance_risks": {
-            "clicks_last_7d": "Used directly from each source interaction in full mode. The code does not reconstruct it from a timestamp-bounded history, so source-data provenance must establish it was computed strictly before the click.",
+            "clicks_last_7d": "In temporal mode it is read from the Past-only user index and frozen at the Past cut-off. In full mode it is used directly from each source interaction, so source-data provenance must establish it was computed strictly before the click.",
             "coarse_score": "Present in the model schema, but observed-click training rows do not join coarse candidates; absent values encode to zero. The feature_usage section verifies whether it was nonzero in the cached training/validation data.",
             "rrf_score_and_source_count": "Present in the model schema, but observed-click training rows do not join recall candidates; absent values encode to zero. If later populated, their request-time generation and history cut-off must be audited before use.",
             "time_features": "click_hour_utc and click_day_of_week_utc are derived from click_timestamp. The raw timestamp itself is blocked, but these non-label calendar transforms are model inputs.",
         },
-        "full_mode_index_warning": "The full-mode inference feature index uses latest source attributes per user/product. It is not used to encode full-mode observed-click training rows, but it is not a strict historical feature store for causal evaluation.",
+        "temporal_feature_contract": temporal_contract,
     }
+    if config.mode == "temporal":
+        result["temporal_candidate_requirement"] = "Inference candidates must be generated from a Past-only recall system and (if coarse_score is used) a model trained no later than Future-A before scoring Future-B. The temporal label cache itself strips all dynamic candidate-score columns from Future-A/B supervision rows."
+    else:
+        result["full_mode_index_warning"] = "The full-mode inference feature index uses latest source attributes per user/product. It is not used to encode full-mode observed-click training rows, but it is not a strict historical feature store for causal evaluation."
+    return result
 
 
 def _split_audit(config: FineRankConfig) -> dict[str, Any]:
@@ -379,6 +406,33 @@ def _render_markdown(report: Mapping[str, Any]) -> str:
     lines = ["# Fine Rank Effect Audit", "", f"- Mode: `{report['mode']}`", f"- Validation rows: {report['rows']['validation']}", f"- ROC-AUC: {metrics['roc_auc']}", f"- PR-AUC: {metrics['pr_auc']}", f"- LogLoss: {metrics['logloss']}", f"- Brier score: {metrics['brier_score']}", f"- ECE: {report['calibration']['ece']}", f"- Exact pair overlap (validation rows): {overlap['exact_user_product_pair_overlap']['validation_row_rate']:.4%}", "", "## Split conclusion", "", split.get("final_score_policy", split["definition"]), "", "## Recommendations", ""]
     lines.extend(f"- {item}" for item in report["recommendations"])
     return "\n".join(lines) + "\n"
+
+
+def _write_full_vs_temporal_report(temporal_report: Mapping[str, Any], audit_config: FineRankAuditConfig) -> Path:
+    """Compare the IID full reference with temporal final metrics, never rank them equally."""
+    path = audit_config.output_path.parent / "fine_rank_full_vs_temporal.json"
+    full: Mapping[str, Any] | None = None
+    if audit_config.full_reference_path is not None and audit_config.full_reference_path.is_file():
+        loaded = json.loads(audit_config.full_reference_path.read_text(encoding="utf-8"))
+        if loaded.get("mode") == "full":
+            full = loaded
+    names = ("roc_auc", "pr_auc", "logloss", "brier_score", "positive_rate")
+    result = {
+        "policy": "Temporal validation is the final generalization metric. Full random-row validation is retained only as an IID/offline upper-bound reference.",
+        "full_reference_available": full is not None,
+        "metrics": {name: {"full_iid_upper_bound": full.get("classification_metrics", {}).get(name) if full else None, "temporal_final": temporal_report["classification_metrics"].get(name)} for name in names},
+        "temporal_ece": temporal_report["calibration"].get("ece"),
+        "full_ece": full.get("calibration", {}).get("ece") if full else None,
+        "temporal_report": temporal_report.get("checkpoint"),
+        "full_report_path": str(audit_config.full_reference_path) if audit_config.full_reference_path else None,
+    }
+    path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    markdown = path.with_suffix(".md")
+    lines = ["# Fine Rank: Full vs Temporal", "", result["policy"], "", "| Metric | Full IID reference | Temporal final |", "| --- | ---: | ---: |"]
+    lines.extend(f"| {name} | {values['full_iid_upper_bound']} | {values['temporal_final']} |" for name, values in result["metrics"].items())
+    lines.extend([f"| ECE | {result['full_ece']} | {result['temporal_ece']} |", ""])
+    markdown.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 
 def _count(connection: sqlite3.Connection, table: str) -> int:

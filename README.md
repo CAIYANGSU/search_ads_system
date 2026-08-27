@@ -144,6 +144,30 @@ Past/full feature SQLite index。`fine_rank.mode: temporal` 会强制使用
 `outputs/temporal/` 下的 temporal coarse candidates、Past features、Future-A
 training labels 与 Future-B validation labels，避免覆盖 full-data 产物。
 
+Temporal cache 会在构建前强制验证 `Past < Future-A < Future-B`。Future-A/B
+只提供 `conversion_label` 与 value supervision；产品/用户属性、`clicks_last_7d`
+和日历时间均来自 Past-only index，Future 标签文件中的 `rrf_score`、
+`source_count`、`coarse_score` 与 `rank` 会被剥离，避免将同时期排序结果带入特征。
+Temporal evaluation 输出 ROC-AUC、PR-AUC、LogLoss、Brier、positive rate、正负样本
+pCVR 分布和 20-bin calibration/ECE。其 audit 会写出 full vs temporal 对比，其中
+temporal 是最终泛化指标，full 仅是 IID/offline upper-bound reference。
+
+```bash
+# Small independent temporal sanity run: creates Past/Future-A/Future-B,
+# trains/evaluates an isolated bounded checkpoint and writes its audit; no inference.
+PYTHONPATH=src python src/pipeline/run_fine_rank.py --config config.yaml --stage temporal_sanity
+```
+
+正式 temporal run 时，使用 `--temporal` 再依次运行下列阶段；它们只读写
+`outputs/temporal/` 的 cache、checkpoint、metrics 与 audit。
+
+```bash
+PYTHONPATH=src python src/pipeline/run_fine_rank.py --config config.yaml --temporal --stage build_dataset
+PYTHONPATH=src python src/pipeline/run_fine_rank.py --config config.yaml --temporal --stage train
+PYTHONPATH=src python src/pipeline/run_fine_rank.py --config config.yaml --temporal --stage evaluate
+PYTHONPATH=src python src/pipeline/run_fine_rank.py --config config.yaml --temporal --stage audit
+```
+
 推理不会把 coarse candidates 回填为训练标签。它会一次预加载可容纳的 feature
 index，随后按 CSV chunk 做向量化 feature join、hash/tensor preparation、GPU batch
 scoring 和按用户 Top-K 写出；日志每百万行报告读入、特征、GPU、排序和写出耗时。

@@ -260,6 +260,26 @@ temporal:
   users:
     max_users: 100000
     seed: 2026
+  # Temporal Fine Rank keeps all artifacts under outputs/temporal.  Set
+  # fine_rank.mode: temporal for a formal run.  The CLI temporal_sanity stage
+  # overlays this bounded block and intentionally skips inference.
+  fine_rank:
+    sanity:
+      max_train_rows: 200000
+      epochs: 1
+      batch_size: 4096
+      inference_batch_size: 16384
+      num_workers: 4
+      persistent_workers: true
+      train: true
+    audit:
+      output_path: outputs/temporal/metrics/fine_rank_audit.json
+      calibration_bins: 20
+      output_chunk_size: 500000
+      ablation_train_rows: 100000
+      ablation_validation_rows: 50000
+      ablation_epochs: 1
+      ablation_batch_size: 8192
   recall:
     itemcf_top_k: 100
     two_tower_top_k: 100

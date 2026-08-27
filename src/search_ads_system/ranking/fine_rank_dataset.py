@@ -31,6 +31,7 @@ LOGGER = logging.getLogger(__name__)
 FEATURE_VERSION = "fine-rank-observed-clicks-v3-bounded-dense"
 DATASET_CONSTRUCTION_VERSION = "observed-clicked-interactions-v2"
 VALUE_TRANSFORM_VERSION = "normalized-log1p-v1"
+TEMPORAL_FEATURE_CONTRACT_VERSION = "past-only-supervision-v2"
 DENSE_FEATURES = (
     "rrf_score", "source_count", "coarse_score", "inverse_coarse_rank",
     "product_price", "log_product_price", "clicks_last_7d", "log_clicks_last_7d",
@@ -48,6 +49,7 @@ LEAKAGE_COLUMNS = {
 DEFAULT_BUCKET_SIZES = (1_000_003, 1_000_003, 10_007, 10_007, 10_007, 100_003, 100_003, 100_003, 100_003, 10_007)
 PRODUCT_COLUMNS = ("product_price", "product_age_group", "product_gender", "product_brand", "product_category_1", "product_category_2", "product_category_3", "product_country")
 USER_COLUMNS = ("clicks_last_7d", "device_type", "click_timestamp")
+TEMPORAL_DYNAMIC_SCORE_COLUMNS = ("rrf_score", "source_count", "coarse_score", "rank")
 MAX_DENSE_ABS_VALUE = 10.0
 
 
@@ -192,6 +194,7 @@ def cache_matches(spec: FineRankDatasetSpec) -> bool:
         and metadata.get("dataset_construction_version") == DATASET_CONSTRUCTION_VERSION
         and transform.get("version") == VALUE_TRANSFORM_VERSION
         and transform.get("configured_prediction_log_clip_max") == spec.value_log_clip_max
+        and (spec.mode != "temporal" or metadata.get("temporal_feature_semantics", {}).get("version") == TEMPORAL_FEATURE_CONTRACT_VERSION)
     )
 
 
@@ -202,6 +205,7 @@ def build_or_reuse_cached_datasets(spec: FineRankDatasetSpec) -> dict[str, Any]:
     describe inference inventory, not observed click-conditioned CVR labels.
     """
     assert_no_fine_rank_leakage(DENSE_FEATURES + SPARSE_FEATURES)
+    temporal_semantics = _assert_temporal_feature_contract(spec) if spec.mode == "temporal" else None
     if cache_matches(spec):
         metadata = json.loads(spec.metadata_path.read_text(encoding="utf-8"))
         LOGGER.info("Reusing fine-rank dataset cache (%s rows): %s", metadata["row_count"], spec.cache_dir)
@@ -258,6 +262,8 @@ def build_or_reuse_cached_datasets(spec: FineRankDatasetSpec) -> dict[str, Any]:
             "row_count": counts["train"], "validation_row_count": counts["validation"],
             "part_count": parts, "value_transform": value_transform, "diagnostics": diagnostics, "config_hash": _config_hash(spec),
         }
+        if temporal_semantics is not None:
+            metadata["temporal_feature_semantics"] = temporal_semantics
         spec.metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
         LOGGER.info("Fine-rank cache built from observed clicks: train=%s validation=%s source_rows=%s conversion_rate=%.6f valid_value_rows=%s requested_max=%s reason=%s", counts["train"], counts["validation"], diagnostics["source_interaction_rows"], diagnostics["conversion_positive_rate"], diagnostics["valid_conversion_value_rows"], spec.max_train_rows, diagnostics["train_rows_shortfall_reason"])
         return metadata
@@ -316,6 +322,10 @@ def _append_observed_split(path: Path, split: str, spec: FineRankDatasetSpec, st
     for chunk in _iter_csv_chunks(path, spec.chunk_size):
         prepared = _prepare_observed_rows(chunk, diagnostics, split)
         if enrich_from_past and not prepared.empty:
+            # Future-A/B files are supervision only. Candidate/ranking scores
+            # in a label file would be contemporaneous or future-derived, so
+            # they must not enter either temporal train or validation features.
+            prepared = prepared.drop(columns=list(TEMPORAL_DYNAMIC_SCORE_COLUMNS), errors="ignore")
             prepared = store.enrich(prepared)
         _append_encoded_rows(encode_feature_frame(prepared, bucket_sizes=spec.bucket_sizes, random_seed=spec.random_seed), split, spec, counts, parts, buffers, diagnostics, value_stats, diagnostic_connection)
 
@@ -376,6 +386,42 @@ def _new_diagnostics(spec: FineRankDatasetSpec) -> dict[str, Any]:
         "train_conversion_positive_rows": 0, "validation_conversion_positive_rows": 0,
         "train_valid_conversion_value_rows": 0, "validation_valid_conversion_value_rows": 0,
     }
+
+
+def _assert_temporal_feature_contract(spec: FineRankDatasetSpec) -> dict[str, Any]:
+    """Prove the three temporal windows are distinct and ordered before use."""
+    if spec.validation_label_path is None:
+        raise ValueError("Temporal fine-rank requires a Future-B validation path")
+    paths = {"past": spec.feature_source_path.resolve(), "future_a": spec.train_label_path.resolve(), "future_b": spec.validation_label_path.resolve()}
+    if len(set(paths.values())) != 3 or any("temporal" not in path.parts for path in paths.values()):
+        raise ValueError("Temporal leakage: Fine-rank Past/Future artifacts must be distinct and isolated below outputs/temporal")
+    bounds = {name: _timestamp_bounds(path, spec.chunk_size) for name, path in paths.items()}
+    if any(lower is None or upper is None for lower, upper in bounds.values()):
+        raise ValueError("Temporal fine-rank requires finite click_timestamp values in Past, Future-A, and Future-B")
+    if not (bounds["past"][1] < bounds["future_a"][0] <= bounds["future_a"][1] < bounds["future_b"][0]):
+        raise ValueError(f"Temporal leakage: expected Past < Future-A < Future-B timestamps, got {bounds}")
+    return {
+        "version": TEMPORAL_FEATURE_CONTRACT_VERSION,
+        "contract": "Past-only feature index; Future-A labels train; Future-B labels validate",
+        "window_timestamp_bounds": {name: {"min": lower, "max": upper} for name, (lower, upper) in bounds.items()},
+        "past_only_feature_columns": [*PRODUCT_COLUMNS, *USER_COLUMNS],
+        "future_label_dynamic_score_columns_dropped": list(TEMPORAL_DYNAMIC_SCORE_COLUMNS),
+        "dynamic_score_semantics": "Temporal Future-A/B supervision encoding uses zero for rrf_score, source_count, coarse_score, and inverse_coarse_rank unless an independently time-stamped Past-only candidate feature pipeline is added.",
+    }
+
+
+def _timestamp_bounds(path: Path, chunk_size: int) -> tuple[int | None, int | None]:
+    lower: int | None = None; upper: int | None = None
+    for chunk in _iter_csv_chunks(path, chunk_size):
+        if "click_timestamp" not in chunk:
+            raise ValueError(f"Temporal fine-rank source is missing click_timestamp: {path}")
+        values = pd.to_numeric(chunk["click_timestamp"], errors="coerce").dropna()
+        if values.empty:
+            continue
+        current_lower, current_upper = int(values.min()), int(values.max())
+        lower = current_lower if lower is None else min(lower, current_lower)
+        upper = current_upper if upper is None else max(upper, current_upper)
+    return lower, upper
 
 
 def _create_diagnostic_tables(connection: sqlite3.Connection) -> None:
@@ -604,5 +650,5 @@ def _finite_or_none(value: object) -> float | None:
 
 
 def _config_hash(spec: FineRankDatasetSpec) -> str:
-    values: Mapping[str, Any] = {"candidate_path": str(spec.candidate_path), "feature_source_path": str(spec.feature_source_path), "train_label_path": str(spec.train_label_path), "validation_label_path": str(spec.validation_label_path), "mode": spec.mode, "max_train_rows": spec.max_train_rows, "chunk_size": spec.chunk_size, "validation_fraction": spec.validation_fraction, "random_seed": spec.random_seed, "bucket_sizes": list(spec.bucket_sizes), "feature_version": FEATURE_VERSION}
+    values: Mapping[str, Any] = {"candidate_path": str(spec.candidate_path), "feature_source_path": str(spec.feature_source_path), "train_label_path": str(spec.train_label_path), "validation_label_path": str(spec.validation_label_path), "mode": spec.mode, "max_train_rows": spec.max_train_rows, "chunk_size": spec.chunk_size, "validation_fraction": spec.validation_fraction, "random_seed": spec.random_seed, "bucket_sizes": list(spec.bucket_sizes), "feature_version": FEATURE_VERSION, "temporal_feature_contract_version": TEMPORAL_FEATURE_CONTRACT_VERSION if spec.mode == "temporal" else None}
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode("utf-8")).hexdigest()

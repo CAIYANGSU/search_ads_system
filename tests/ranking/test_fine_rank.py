@@ -258,12 +258,19 @@ def test_temporal_uses_past_only_features_with_future_labels(tmp_path: Path) -> 
     past = tmp_path / "temporal" / "split" / "past"; future_a = tmp_path / "temporal" / "split" / "future_a"; future_b = tmp_path / "temporal" / "split" / "future_b"
     past.mkdir(parents=True); future_a.mkdir(parents=True); future_b.mkdir(parents=True)
     pd.DataFrame([{"user_id": "u", "product_id": "a", "conversion_label": 0, "conversion_value_eur": np.nan, "click_timestamp": 1, "product_price": 1.0, "clicks_last_7d": 1}]).to_csv(past / "part-00000.csv", index=False)
-    pd.DataFrame([{"user_id": "u", "product_id": "a", "conversion_label": 1, "conversion_value_eur": 9.0, "click_timestamp": 2, "product_price": 999.0, "clicks_last_7d": 99}]).to_csv(future_a / "part-00000.csv", index=False)
+    pd.DataFrame([{"user_id": "u", "product_id": "a", "conversion_label": 1, "conversion_value_eur": 9.0, "click_timestamp": 2, "product_price": 999.0, "clicks_last_7d": 99, "coarse_score": .99, "rrf_score": .88}]).to_csv(future_a / "part-00000.csv", index=False)
     pd.DataFrame([{"user_id": "u", "product_id": "a", "conversion_label": 0, "conversion_value_eur": np.nan, "click_timestamp": 3, "product_price": 999.0, "clicks_last_7d": 99}]).to_csv(future_b / "part-00000.csv", index=False)
     candidates = tmp_path / "temporal" / "ranking" / "coarse.csv"; candidates.parent.mkdir(parents=True)
     pd.DataFrame([{"user_id": "u", "candidate_ad_id": "a", "coarse_score": .5, "rank": 1}]).to_csv(candidates, index=False)
     config = FineRankConfig(mode="temporal", input_path=candidates, output_path=tmp_path / "temporal" / "ranking" / "fine.csv", model_path=tmp_path / "temporal" / "models" / "model.pt", cache_dir=tmp_path / "temporal" / "ranking" / "fine_rank" / "train", feature_source_path=past, train_label_path=future_a, validation_label_path=future_b, metrics_path=tmp_path / "temporal" / "metrics.json", max_train_rows=10, chunk_size=10, embedding_dim=4, hidden_dims=(8,), num_cross_layers=1, batch_size=1, inference_batch_size=1, epochs=1, num_workers=0, prefetch_factor=1, persistent_workers=False, bucket_sizes=(17,) * len(SPARSE_FEATURES), validation_fraction=.1)
-    build_dataset(config)
+    metadata = build_dataset(config)
+    assert metadata["mode"] == "temporal"
+    assert metadata["temporal_feature_semantics"]["contract"] == "Past-only feature index; Future-A labels train; Future-B labels validate"
+    assert metadata["temporal_feature_semantics"]["window_timestamp_bounds"] == {
+        "past": {"min": 1, "max": 1}, "future_a": {"min": 2, "max": 2}, "future_b": {"min": 3, "max": 3},
+    }
     row = next(iter(FineRankParquetDataset(config.cache_dir)))
     assert row["label"] == 1.0
     assert row["dense"][DENSE_FEATURES.index("product_price")] == pytest.approx(np.log1p(1.0) / 5.0)
+    assert row["dense"][DENSE_FEATURES.index("coarse_score")] == 0.0
+    assert row["dense"][DENSE_FEATURES.index("rrf_score")] == 0.0

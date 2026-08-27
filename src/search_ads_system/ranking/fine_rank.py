@@ -88,15 +88,16 @@ def parse_fine_rank_config(raw_config: Mapping[str, Any], config_path: Path) -> 
     mode = str(options.get("mode", "full")).lower()
     if mode not in {"full", "temporal"}:
         raise ValueError("fine_rank.mode must be full or temporal")
-    seed = int(options.get("random_seed", raw_config.get("project", {}).get("seed", 2026)))
-    buckets_raw = options.get("hash_buckets", {})
-    if buckets_raw and not isinstance(buckets_raw, Mapping):
-        raise ValueError("fine_rank.hash_buckets must be a mapping")
-    bucket_sizes = tuple(int(buckets_raw.get(name, default)) for name, default in zip(SPARSE_FEATURES, DEFAULT_BUCKET_SIZES))
     if mode == "temporal":
         temporal = raw_config.get("temporal", {})
         if not isinstance(temporal, Mapping):
             raise ValueError("fine_rank temporal mode requires a temporal mapping")
+        temporal_options = temporal.get("fine_rank", {})
+        if not isinstance(temporal_options, Mapping):
+            raise ValueError("temporal.fine_rank must be a mapping")
+        # The temporal block permits a deliberately small sanity configuration
+        # without changing full-mode defaults or artifact paths.
+        options = {**options, **temporal_options}
         temporal_root = resolve_path(str(temporal.get("output_dir", "outputs/temporal")), root)
         input_path = temporal_root / "ranking" / "coarse_rank_topk.csv"
         output_path = temporal_root / "ranking" / "fine_rank_topk.csv"
@@ -115,6 +116,11 @@ def parse_fine_rank_config(raw_config: Mapping[str, Any], config_path: Path) -> 
         train_labels = feature_source
         validation_labels = None
         metrics_path = output_path.parent / "fine_rank_metrics.json"
+    seed = int(options.get("random_seed", raw_config.get("project", {}).get("seed", 2026)))
+    buckets_raw = options.get("hash_buckets", {})
+    if buckets_raw and not isinstance(buckets_raw, Mapping):
+        raise ValueError("fine_rank.hash_buckets must be a mapping")
+    bucket_sizes = tuple(int(buckets_raw.get(name, default)) for name, default in zip(SPARSE_FEATURES, DEFAULT_BUCKET_SIZES))
     early = options.get("early_stopping", {})
     if not isinstance(early, Mapping):
         raise ValueError("fine_rank.early_stopping must be a mapping")
@@ -230,6 +236,13 @@ def save_checkpoint(model: DCNv2MultiTask, optimizer: AdamW, config: FineRankCon
 def load_fine_ranker(config: FineRankConfig, device: torch.device | None = None) -> tuple[DCNv2MultiTask, dict[str, Any]]:
     target = device or resolve_device(config.device)
     checkpoint = torch.load(config.model_path, map_location=target, weights_only=False)
+    checkpoint_mode = checkpoint.get("config", {}).get("mode")
+    if checkpoint_mode != config.mode:
+        raise ValueError(f"Fine-rank checkpoint mode mismatch: checkpoint={checkpoint_mode!r}, requested={config.mode!r}; full and temporal artifacts must never be reused")
+    if config.mode == "temporal":
+        checkpoint_metadata = checkpoint.get("dataset_metadata", {})
+        if checkpoint_metadata.get("mode") != "temporal" or "temporal_feature_semantics" not in checkpoint_metadata:
+            raise ValueError("Temporal fine-rank checkpoint lacks Past/Future contract metadata; rebuild and retrain the isolated temporal artifact")
     schema = checkpoint.get("feature_schema", {})
     if schema.get("dense") != list(DENSE_FEATURES) or schema.get("sparse") != list(SPARSE_FEATURES):
         raise ValueError("Fine-rank checkpoint feature schema does not match the current leakage-safe schema")

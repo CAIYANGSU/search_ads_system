@@ -73,9 +73,11 @@ def evaluate_fine_rank_predictions(rows: Iterable[dict[str, Any]], *, cutoffs: t
         "roc_auc": float(roc_auc_score(y, p)) if len(np.unique(y)) == 2 else None,
         "pr_auc": float(average_precision_score(y, p)) if len(np.unique(y)) == 2 else None,
         "logloss": float(log_loss(y, p, labels=[0, 1])) if len(y) else None,
+        "brier_score": float(np.mean(np.square(p.astype(np.float64) - y.astype(np.float64)))) if len(y) else None,
+        "positive_rate": float(np.mean(y)) if len(y) else None,
     }
     value_metrics = _value_metrics(observed[value_mask], predicted[value_mask])
-    result = {"pcvr": cvr, "value": value_metrics, "ranking": {f"ndcg@{k}": _divide(ndcg[k], users_with_conversion) for k in cutoffs} | {f"recall@{k}": _divide(recall[k], users_with_conversion) for k in cutoffs} | {f"hit_rate@{k}": _divide(hit[k], users_with_conversion) for k in cutoffs}, "expected_value_comparison": _finalize_comparison(comparison), "users_with_conversion": users_with_conversion, "rows": int(len(y))}
+    result = {"pcvr": cvr, "pcvr_distribution": {"conversion_label_1": _distribution(p[y == 1]), "conversion_label_0": _distribution(p[y == 0])}, "calibration": _calibration(y, p), "value": value_metrics, "ranking": {f"ndcg@{k}": _divide(ndcg[k], users_with_conversion) for k in cutoffs} | {f"recall@{k}": _divide(recall[k], users_with_conversion) for k in cutoffs} | {f"hit_rate@{k}": _divide(hit[k], users_with_conversion) for k in cutoffs}, "expected_value_comparison": _finalize_comparison(comparison), "users_with_conversion": users_with_conversion, "rows": int(len(y))}
     return result
 
 
@@ -114,3 +116,27 @@ def _finalize_comparison(comparison: dict[str, dict[int, dict[str, float]]]) -> 
 
 def _divide(value: float, divisor: int) -> float:
     return float(value / divisor) if divisor else 0.0
+
+
+def _distribution(values: np.ndarray) -> dict[str, float | int | None]:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return {"rows": 0, "min": None, "p50": None, "p90": None, "p95": None, "p99": None, "max": None}
+    return {"rows": int(len(values)), "min": float(values.min()), "p50": float(np.quantile(values, .50)), "p90": float(np.quantile(values, .90)), "p95": float(np.quantile(values, .95)), "p99": float(np.quantile(values, .99)), "max": float(values.max())}
+
+
+def _calibration(labels: np.ndarray, probabilities: np.ndarray, bins: int = 20) -> dict[str, object]:
+    labels = np.asarray(labels, dtype=np.float32); probabilities = np.asarray(probabilities, dtype=np.float32)
+    output: list[dict[str, float | int | None]] = []; ece = 0.0
+    for index in range(bins):
+        lower, upper = index / bins, (index + 1) / bins
+        mask = (probabilities >= lower) & ((probabilities < upper) if index < bins - 1 else (probabilities <= upper))
+        rows = int(mask.sum())
+        if not rows:
+            output.append({"bin": index, "lower": lower, "upper": upper, "rows": 0, "mean_predicted_pcvr": None, "actual_conversion_rate": None, "calibration_error": None})
+            continue
+        predicted = float(probabilities[mask].mean()); actual = float(labels[mask].mean()); error = abs(predicted - actual)
+        ece += rows / len(labels) * error
+        output.append({"bin": index, "lower": lower, "upper": upper, "rows": rows, "mean_predicted_pcvr": predicted, "actual_conversion_rate": actual, "calibration_error": error})
+    return {"bin_count": bins, "ece": float(ece), "bins": output}
