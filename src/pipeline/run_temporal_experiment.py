@@ -4,7 +4,7 @@ import argparse, json, logging, sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]; sys.path.insert(0,str(ROOT/"src"))
 from search_ads_system.common.config import load_yaml_config
-from search_ads_system.evaluation.temporal import build_temporal_split, evaluate_recall_file, parse_temporal_config, run_temporal_coarse
+from search_ads_system.evaluation.temporal import build_temporal_split, diagnose_temporal_recall_sources, diagnose_two_tower_cold_start, evaluate_recall_file, parse_temporal_config, run_temporal_coarse, temporal_pipeline_diagnostics
 from search_ads_system.recall.itemcf_recall import ItemCFRecallConfig, generate_itemcf_candidates, load_interactions as load_itemcf, write_candidates as write_itemcf
 from search_ads_system.recall.popularity_recall import PopularityRecallConfig, generate_popularity_candidates, write_candidates as write_popularity
 from search_ads_system.recall.rrf_fusion import RRFFusionConfig, fuse_and_write_candidates
@@ -35,7 +35,9 @@ def _evaluate(raw, temporal):
     for name in ('itemcf','two_tower','popularity','fused'):
         path=paths/f'{name}_topk.csv' if name!='fused' else paths/'fused_candidates.csv'
         metrics[name]=evaluate_recall_file(path,future,chunk_size=temporal.chunk_size)
-    target=temporal.output_dir/'metrics'; target.mkdir(parents=True,exist_ok=True); (target/'recall_metrics.json').write_text(json.dumps(metrics,indent=2,sort_keys=True),encoding='utf-8')
+    diagnostic=diagnose_temporal_recall_sources({name: paths/f'{name}_topk.csv' if name!='fused' else paths/'fused_candidates.csv' for name in ('itemcf','two_tower','popularity','fused')},future,chunk_size=temporal.chunk_size)
+    two_tower=diagnose_two_tower_cold_start(temporal.output_dir/'split'/'past',future,chunk_size=temporal.chunk_size)
+    target=temporal.output_dir/'metrics'; target.mkdir(parents=True,exist_ok=True); (target/'recall_metrics.json').write_text(json.dumps(metrics,indent=2,sort_keys=True),encoding='utf-8'); (target/'recall_diagnostics.json').write_text(json.dumps({'pipeline':temporal_pipeline_diagnostics(temporal),'recall_sources':diagnostic,'two_tower_cold_start':two_tower},indent=2,sort_keys=True),encoding='utf-8')
     rows=[]
     for name,value in metrics.items():
         for metric,score in value['metrics'].items(): rows.append({'source':name,'metric':metric,'value':score})
@@ -54,7 +56,7 @@ def main()->None:
         result['recall_metrics']=_evaluate(raw,temporal)
     if args.stage in ('coarse','all'):
         result['coarse_metrics']=run_temporal_coarse(temporal,max_train_rows=int(raw.get('temporal',{}).get('coarse_rank',{}).get('max_train_rows',2_000_000)),top_k=int(raw.get('temporal',{}).get('coarse_rank',{}).get('top_k',50)))
-        target=temporal.output_dir/'metrics'; summary={'split':result.get('split',json.loads((temporal.output_dir/'split'/'metadata.json').read_text())),'recall':result.get('recall_metrics',{}),'coarse':result['coarse_metrics'],'leakage':{'passed':True}}
+        target=temporal.output_dir/'metrics'; summary={'split':result.get('split',json.loads((temporal.output_dir/'split'/'metadata.json').read_text())),'pipeline':temporal_pipeline_diagnostics(temporal),'recall':result.get('recall_metrics',{}),'coarse':result['coarse_metrics'],'leakage':{'passed':True}}
         (target/'temporal_experiment_summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True),encoding='utf-8')
     print(json.dumps(result,indent=2,sort_keys=True))
 if __name__=="__main__": main()

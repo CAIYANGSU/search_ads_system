@@ -13,7 +13,7 @@ import logging
 import sqlite3
 import pickle
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -135,6 +135,79 @@ def evaluate_recall_file(candidate_path: Path, future_path: Path, *, cutoffs: It
             "metrics": {f"recall@{k}": _divide(recalls[k], users) for k in cutoffs} | {f"hit_rate@{k}": _divide(users_hit[k], users) for k in cutoffs}}
 
 
+def diagnose_temporal_recall_sources(paths: Mapping[str, Path], future_path: Path, *, chunk_size: int, cutoff: int = 100) -> dict[str, Any]:
+    """Compare recall routes by Future hit coverage, overlap and incrementality."""
+    positives = _future_positives(future_path, chunk_size); target_pairs = {(user, product) for user, products in positives.items() for product in products}
+    source_hits: dict[str, set[tuple[str, str]]] = {}; source_rows: dict[str, int] = {}; source_users: dict[str, set[str]] = {}; source_items: dict[str, set[str]] = {}
+    for name, path in paths.items():
+        header = set(pd.read_csv(path, nrows=0).columns); rows = 0; users: set[str] = set(); items: set[str] = set(); hits: set[tuple[str, str]] = set()
+        if "user_id" not in header:
+            candidates: list[str] = []
+            for chunk in pd.read_csv(path, usecols=["candidate_ad_id", "rank"], chunksize=chunk_size, low_memory=False):
+                for product, rank in chunk.itertuples(index=False, name=None):
+                    if _recall_rank(rank) <= cutoff and (candidate := _id(product)) is not None:
+                        candidates.append(candidate); items.add(candidate); rows += 1
+            candidate_set = set(candidates)
+            hits = {(user, product) for user, product in target_pairs if product in candidate_set}
+            users = set(positives)
+        else:
+            current_user: str | None = None; position = 0
+            columns = ["user_id", "candidate_ad_id"] + (["rank"] if "rank" in header else [])
+            for chunk in pd.read_csv(path, usecols=columns, chunksize=chunk_size, low_memory=False):
+                for row in chunk.itertuples(index=False, name=None):
+                    user, product = _id(row[0]), _id(row[1])
+                    if user is None or product is None:
+                        continue
+                    if user != current_user:
+                        current_user = user; position = 0
+                    position += 1; rank = _recall_rank(row[2]) if "rank" in header else position
+                    if rank <= cutoff:
+                        rows += 1; users.add(user); items.add(product)
+                        if (user, product) in target_pairs: hits.add((user, product))
+        source_hits[name] = hits; source_rows[name] = rows; source_users[name] = users; source_items[name] = items
+    sources: dict[str, Any] = {}
+    for name, hits in source_hits.items():
+        sources[name] = {"candidate_rows_at_cutoff": source_rows[name], "candidate_users_at_cutoff": len(source_users[name]), "candidate_user_coverage": _divide(len(source_users[name] & set(positives)), len(positives)), "unique_items": len(source_items[name]), "hit_positive_pairs": len(hits), "positive_pair_coverage": _divide(len(hits), len(target_pairs)), "hit_users": len({user for user, _ in hits}), "hit_rate": _divide(len({user for user, _ in hits}), len(positives))}
+    overlap = {f"{left}__{right}": {"shared_hit_positive_pairs": len(source_hits[left] & source_hits[right]), "jaccard": _divide(len(source_hits[left] & source_hits[right]), len(source_hits[left] | source_hits[right]))} for index, left in enumerate(source_hits) for right in list(source_hits)[index + 1:]}
+    union: set[tuple[str, str]] = set(); incremental: dict[str, Any] = {}
+    for name in ("itemcf", "two_tower", "popularity", "fused"):
+        if name not in source_hits: continue
+        added = source_hits[name] - union; union |= source_hits[name]
+        incremental[name] = {"incremental_hit_positive_pairs": len(added), "incremental_positive_pair_coverage": _divide(len(added), len(target_pairs)), "union_positive_pair_coverage": _divide(len(union), len(target_pairs))}
+    popularity = source_hits.get("popularity", set()); fused = source_hits.get("fused", set())
+    return {"cutoff": cutoff, "future_positive_users": len(positives), "future_positive_pairs": len(target_pairs), "sources": sources, "hit_overlap": overlap, "incremental_recall": incremental, "rrf_popularity_hit_retention": _divide(len(popularity & fused), len(popularity)), "interpretation": "A low RRF popularity-hit retention means RRF/top-K fusion displaced popularity hits; tune source weights/top_k only after this diagnostic, not from aggregate recall alone."}
+
+
+def diagnose_two_tower_cold_start(past_path: Path, future_path: Path, *, chunk_size: int) -> dict[str, Any]:
+    """ID-only Two Tower cannot represent unseen IDs except through fallback behavior."""
+    past_users: set[str] = set(); past_products: set[str] = set()
+    for chunk in iter_csv_parts(past_path, chunk_size):
+        past_users.update(value for value in (_id(item) for item in chunk["user_id"]) if value is not None); past_products.update(value for value in (_id(item) for item in chunk["product_id"]) if value is not None)
+    rows = 0; seen_user = 0; seen_product = 0; seen_both = 0
+    for chunk in iter_csv_parts(future_path, chunk_size):
+        for user, product in chunk[["user_id", "product_id"]].itertuples(index=False, name=None):
+            user_id, product_id = _id(user), _id(product)
+            if user_id is None or product_id is None: continue
+            rows += 1; user_seen = user_id in past_users; product_seen = product_id in past_products
+            seen_user += int(user_seen); seen_product += int(product_seen); seen_both += int(user_seen and product_seen)
+    return {"rows": rows, "seen_user_rate": _divide(seen_user, rows), "seen_product_rate": _divide(seen_product, rows), "seen_user_and_product_rate": _divide(seen_both, rows), "unseen_user_rate": _divide(rows - seen_user, rows), "unseen_product_rate": _divide(rows - seen_product, rows), "model_capability_warning": "Current TwoTowerRecall uses only user/ad ID embeddings. Unseen IDs cannot gain content-based representations; add product category/brand/price and user-context towers before expecting strict temporal cold-start gains."}
+
+
+def temporal_pipeline_diagnostics(config: TemporalConfig) -> dict[str, Any]:
+    """Rows/users/observed positives for the revised temporal contract."""
+    past_ab = build_past_ab_split(config); future_ab = build_future_ab_split(config); root = config.output_dir
+    def window(path: Path) -> dict[str, int]:
+        rows = 0; users: set[str] = set(); products: set[str] = set(); conversions = 0
+        for chunk in iter_csv_parts(path, config.chunk_size):
+            rows += len(chunk); users.update(value for value in (_id(item) for item in chunk["user_id"]) if value is not None); products.update(value for value in (_id(item) for item in chunk["product_id"]) if value is not None)
+            conversions += int(pd.to_numeric(chunk.get("conversion_label", pd.Series(0, index=chunk.index)), errors="coerce").eq(1).sum())
+        observed_pairs = _future_positives(path, config.chunk_size)
+        return {"rows": rows, "users": len(users), "observed_click_positive_pairs": sum(len(value) for value in observed_pairs.values()), "unique_products": len(products), "conversion_positive_rows": conversions}
+    split_metadata = json.loads((root / "split" / "metadata.json").read_text(encoding="utf-8")) if (root / "split" / "metadata.json").is_file() else {}
+    selected = int(split_metadata.get("selected_users", 0)); eligible = int(split_metadata.get("eligible_users", 0))
+    return {"contract": {"past_a": "history, product features and sampled-negative pool", "past_b": "direct observed-click coarse supervision", "future_a": "coarse candidate-inventory evaluation", "future_b": "held out for downstream final evaluation"}, "windows": {name: window(root / "split" / name) for name in ("past_a", "past_b", "future_a", "future_b")}, "past_ab": past_ab, "future_ab": future_ab, "selected_users": selected, "eligible_users": eligible, "eligible_user_scale_factor": _divide(eligible, selected), "max_users_interpretation": "Increasing max_users can only scale observed Past-B positives approximately linearly. It cannot repair the prior recall-hit supervision bottleneck; the revised contract removes that bottleneck first."}
+
+
 def _evaluate_candidate_mapping(mapping: Mapping[str,list[tuple[str,int]]], positives: Mapping[str,set[str]], cutoffs: Iterable[int]) -> dict[str,Any]:
     cutoffs=tuple(int(k) for k in cutoffs); recalls={k:0. for k in cutoffs}; hits={k:0 for k in cutoffs}; ads=set()
     for user,target in positives.items():
@@ -177,51 +250,119 @@ def build_future_ab_split(config: TemporalConfig) -> dict[str, Any]:
     metadata.write_text(json.dumps(result,indent=2,sort_keys=True)); return result
 
 
-def run_temporal_coarse(config: TemporalConfig, *, max_train_rows:int=2_000_000, top_k:int=50, negatives_per_positive:int=5) -> dict[str,Any]:
-    """Train on Future-A labels, validate/retain only Future-B labels.
+def build_past_ab_split(config: TemporalConfig) -> dict[str, Any]:
+    """Split Past into Past-A (history) and Past-B (coarse supervision).
 
-    Features are built from a Past-only SQLite index; Future data is only kept
-    in pair-label maps.  The implementation is intentionally a bounded
-    baseline for temporal experiment sizes, not the full-data coarse pipeline.
+    This keeps coarse training independent from whether a later recall system
+    happens to retrieve an observed click.  Both windows precede Future-A/B.
     """
-    ab=build_future_ab_split(config); root=config.output_dir; fused=root/'recall_candidates'/'fused_candidates.csv'; past=root/'split'/'past'
+    source = config.output_dir / "split" / "past"; metadata = config.output_dir / "split" / "past_ab_metadata.json"
+    if metadata.exists():
+        return json.loads(metadata.read_text())
+    values = [pd.to_numeric(chunk[config.timestamp_column], errors="coerce").dropna().to_numpy(dtype=np.int64) for chunk in iter_csv_parts(source, config.chunk_size)]
+    timestamps = np.concatenate(values) if values else np.empty(0, dtype=np.int64)
+    if not len(timestamps):
+        raise ValueError("Past split has no timestamps for Past-A/Past-B")
+    threshold = int(np.quantile(timestamps, .5, method="higher"))
+    past_a, past_b = config.output_dir / "split" / "past_a", config.output_dir / "split" / "past_b"
+    _write_window_parts(source, past_a, config, lambda timestamp: timestamp <= threshold)
+    _write_window_parts(source, past_b, config, lambda timestamp: timestamp > threshold)
+    def stats(path: Path) -> dict[str, int | None]:
+        rows = 0; users: set[str] = set(); lower: int | None = None; upper: int | None = None
+        for chunk in iter_csv_parts(path, config.chunk_size):
+            rows += len(chunk); users.update(str(value) for value in chunk["user_id"].dropna())
+            current = pd.to_numeric(chunk[config.timestamp_column], errors="coerce").dropna()
+            if len(current):
+                lower = int(current.min()) if lower is None else min(lower, int(current.min()))
+                upper = int(current.max()) if upper is None else max(upper, int(current.max()))
+        return {"rows": rows, "users": len(users), "time_min": lower, "time_max": upper}
+    result = {"past_ab_split_timestamp": threshold, "past_a": stats(past_a), "past_b": stats(past_b), "contract": "Past-A builds history/statistics and sampled-negative pools; Past-B observed clicks supply coarse train positives."}
+    if result["past_a"]["time_max"] is None or result["past_b"]["time_min"] is None or result["past_a"]["time_max"] >= result["past_b"]["time_min"]:
+        raise ValueError("Temporal leakage: Past-A/Past-B overlap")
+    metadata.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    return result
+
+
+def run_temporal_coarse(config: TemporalConfig, *, max_train_rows:int=2_000_000, top_k:int=50, negatives_per_positive:int=5) -> dict[str,Any]:
+    """Train coarse ranker from Past-B observed clicks, not recall hits.
+
+    A sampled non-positive is a training surrogate drawn from a Past-A
+    popularity pool.  It is never claimed to be an observed impression
+    negative.  Future-A is candidate-inventory evaluation only; Future-B is
+    untouched by this coarse training contract.
+    """
+    future_ab = build_future_ab_split(config); past_ab = build_past_ab_split(config); root=config.output_dir; fused=root/'recall_candidates'/'fused_candidates.csv'; past_a=root/'split'/'past_a'; past_b=root/'split'/'past_b'; future_a=root/'split'/'future_a'
     if not fused.exists(): raise FileNotFoundError(f'Build temporal RRF first: {fused}')
-    a,b=_future_positives(root/'split'/'future_a',config.chunk_size),_future_positives(root/'split'/'future_b',config.chunk_size)
-    a_conversions=_future_conversion_positives(root/'split'/'future_a',config.chunk_size)
-    cc=CoarseRankConfig(fused,past,root/'ranking'/'coarse_rank_topk.csv',root/'models'/'coarse_rank_model.pkl',max_train_rows=max_train_rows,max_users=config.max_users,top_k=top_k,chunk_size=config.chunk_size,random_seed=config.seed,negatives_per_positive=negatives_per_positive)
-    store=build_interaction_feature_index(cc,root/'models'/'.temporal_past_features.sqlite')
+    train_positives = _future_positives(past_b, config.chunk_size); train_conversions = _future_conversion_positives(past_b, config.chunk_size); evaluation_positives = _future_positives(future_a, config.chunk_size)
+    popularity_pool = _past_popularity_pool(past_a, config.chunk_size)
+    cc=CoarseRankConfig(fused,past_a,root/'ranking'/'coarse_rank_topk.csv',root/'models'/'coarse_rank_model.pkl',max_train_rows=max_train_rows,max_users=config.max_users,top_k=top_k,chunk_size=config.chunk_size,random_seed=config.seed,negatives_per_positive=negatives_per_positive)
+    store=build_interaction_feature_index(cc,root/'models'/'.temporal_past_a_features.sqlite')
     try:
-        xs=[]; ys=[]; ws=[]; train_users=set(); train_pos=0
-        for user,candidates in _candidate_frame_groups(fused,config.chunk_size):
-            positives=a.get(user,set()); label=candidates.candidate_ad_id.astype(str).isin(positives).to_numpy(dtype=np.int8)
-            pos=np.flatnonzero(label); neg=np.flatnonzero(~label)
-            if not len(pos): continue
-            chosen=np.concatenate((pos,neg[:min(len(neg),len(pos)*negatives_per_positive)]))
-            if sum(len(x) for x in ys)+len(chosen)>max_train_rows: continue
-            picked=store.enrich(candidates.iloc[chosen]); picked_labels=label[chosen]
-            xs.append(preprocess_features(picked)); ys.append(picked_labels)
-            ws.append(_future_a_sample_weights(picked_labels,picked.candidate_ad_id,a_conversions.get(user,set())))
-            train_users.add(user); train_pos+=len(pos)
-        if not xs or len(np.unique(np.concatenate(ys)))<2: raise ValueError('Temporal coarse needs Future-A positive and negative candidates')
+        xs=[]; ys=[]; ws=[]; train_users=set(); train_pos=0; sampled_negatives=0; dropped_for_limit=0
+        for user, positives in train_positives.items():
+            remaining = max_train_rows - sum(len(value) for value in ys)
+            if remaining <= 1:
+                dropped_for_limit += len(positives); continue
+            max_positive = max(1, remaining // (1 + negatives_per_positive))
+            selected_positives = sorted(positives)[:max_positive]
+            dropped_for_limit += len(positives) - len(selected_positives)
+            negatives = _sample_nonpositive_candidates(user, set(selected_positives), popularity_pool, min(len(selected_positives) * negatives_per_positive, remaining - len(selected_positives)), config.seed)
+            pairs = [(ad, 1) for ad in selected_positives] + [(ad, 0) for ad in negatives]
+            if not pairs:
+                continue
+            frame = pd.DataFrame({"user_id": user, "candidate_ad_id": [ad for ad, _ in pairs], "rrf_score": 0.0, "source_count": 0.0})
+            picked = store.enrich(frame); labels = np.asarray([label for _, label in pairs], dtype=np.int8)
+            xs.append(preprocess_features(picked)); ys.append(labels); ws.append(_future_a_sample_weights(labels, picked.candidate_ad_id, train_conversions.get(user, set())))
+            train_users.add(user); train_pos += int(labels.sum()); sampled_negatives += int((labels == 0).sum())
+        if not xs or len(np.unique(np.concatenate(ys)))<2: raise ValueError('Temporal coarse needs Past-B positives and sampled non-positive candidates')
         X=np.concatenate(xs); y=np.concatenate(ys); w=np.concatenate(ws)
         model=HistGradientBoostingClassifier(max_iter=100,random_state=config.seed).fit(X,y,sample_weight=w)
         cc.model_path.parent.mkdir(parents=True,exist_ok=True); pickle.dump(model,cc.model_path.open('wb'))
-        scores=[]; labels=[]; before=0; retained={20:0,30:0,50:0,70:0}; users_before=set(); users_after={k:set() for k in retained}; eval_users=set()
+        scores=[]; labels=[]; before=0; retained={20:0,30:0,50:0,70:0}; users_before=set(); users_after={k:set() for k in retained}; eval_users=set(); candidate_rows=0; candidate_users=set(); output_rows=[]
         for user,candidates in _candidate_frame_groups(fused,config.chunk_size):
-            target=b.get(user,set())
+            target=evaluation_positives.get(user,set())
             if not target: continue
-            eval_users.add(user); frame=store.enrich(candidates); s=model.predict_proba(preprocess_features(frame))[:,1]; l=frame.candidate_ad_id.astype(str).isin(target).to_numpy(dtype=np.int8); scores.extend(s); labels.extend(l)
+            eval_users.add(user); candidate_users.add(user); candidate_rows += len(candidates); frame=store.enrich(candidates); s=model.predict_proba(preprocess_features(frame))[:,1]; l=frame.candidate_ad_id.astype(str).isin(target).to_numpy(dtype=np.int8); scores.extend(s); labels.extend(l)
             positive=np.flatnonzero(l); before+=len(positive); users_before.update([user] if len(positive) else [])
             order=np.lexsort((frame.candidate_ad_id.astype(str).to_numpy(),-pd.to_numeric(frame.rrf_score).to_numpy(),-s))
             for k in retained:
                 kept=set(order[:k]); n=sum(i in kept for i in positive); retained[k]+=n
                 if n: users_after[k].add(user)
-        labels=np.asarray(labels); scores=np.asarray(scores); metrics={'roc_auc':float(roc_auc_score(labels,scores)) if len(np.unique(labels))==2 else None,'pr_auc':float(average_precision_score(labels,scores)) if len(np.unique(labels))==2 else None,'logloss':float(log_loss(labels,scores,labels=[0,1])) if len(labels) else None,
-                 'future_a_positive_candidates':train_pos,'future_a_positive_users':len(train_users),'future_b_positive_candidates_before_coarse':before,'users_used_for_coarse_train':len(train_users),'users_used_for_coarse_eval':len(eval_users),'retention':{f'retention@{k}':_divide(retained[k],before) for k in retained},'positive_after_topk':retained,'users_with_positive_before_coarse':len(users_before),'users_with_positive_after_topk':{k:len(v) for k,v in users_after.items()},'leakage_passed':True,'future_ab':ab}
+            for rank, index in enumerate(order[:top_k], start=1): output_rows.append((user, str(frame.candidate_ad_id.iloc[index]), float(s[index]), rank))
+        labels=np.asarray(labels); scores=np.asarray(scores); all_train_positive_pairs=sum(len(value) for value in train_positives.values()); all_eval_positive_pairs=sum(len(value) for value in evaluation_positives.values())
+        metrics={'roc_auc':float(roc_auc_score(labels,scores)) if len(np.unique(labels))==2 else None,'pr_auc':float(average_precision_score(labels,scores)) if len(np.unique(labels))==2 else None,'logloss':float(log_loss(labels,scores,labels=[0,1])) if len(labels) else None,
+                 'training_contract':'Past-B observed clicks are direct positives; negatives are sampled non-positive candidates from a Past-A popularity pool, not exposure negatives. Recall hit is never required for a train positive.', 'past_b_observed_positive_candidates':all_train_positive_pairs,'past_b_observed_positive_users':len(train_positives),'train_positive_candidates_used':train_pos,'users_used_for_coarse_train':len(train_users),'sampled_nonpositive_candidates':sampled_negatives,'dropped_positive_candidates_by_max_train_rows':dropped_for_limit,'future_a_positive_candidates_before_coarse':all_eval_positive_pairs,'future_a_positive_candidates_in_recall_inventory':before,'future_a_recall_positive_coverage':_divide(before,all_eval_positive_pairs),'users_with_future_a_positive':len(evaluation_positives),'users_with_future_a_positive_in_inventory':len(users_before),'users_used_for_coarse_eval':len(eval_users),'candidate_rows_evaluated':candidate_rows,'candidate_coverage_per_future_a_user':_divide(candidate_rows,len(evaluation_positives)),'retention':{f'retention@{k}':_divide(retained[k],before) for k in retained},'positive_after_topk':retained,'users_with_positive_after_topk':{k:len(v) for k,v in users_after.items()},'evaluation_caveat':'Future-A labels mark observed clicks inside recall inventory; non-matches are candidate-inventory non-positives, not verified exposure negatives.','leakage_passed':True,'past_ab':past_ab,'future_ab':future_ab}
+        cc.output_path.parent.mkdir(parents=True,exist_ok=True); pd.DataFrame(output_rows,columns=['user_id','candidate_ad_id','coarse_score','rank']).to_csv(cc.output_path,index=False)
         target=root/'metrics'; target.mkdir(parents=True,exist_ok=True); (target/'coarse_metrics.json').write_text(json.dumps(metrics,indent=2,sort_keys=True)); pd.DataFrame([{'metric':k,'value':v} for k,v in metrics.items() if isinstance(v,(float,int))]+[{'metric':k,'value':v} for k,v in metrics['retention'].items()]).to_csv(target/'coarse_metrics.csv',index=False)
         return metrics
     finally:
-        store.close(); (root/'models'/'.temporal_past_features.sqlite').unlink(missing_ok=True)
+        store.close(); (root/'models'/'.temporal_past_a_features.sqlite').unlink(missing_ok=True)
+
+
+def _past_popularity_pool(path: Path, chunk_size: int) -> list[str]:
+    counts: dict[str, int] = defaultdict(int)
+    for chunk in iter_csv_parts(path, chunk_size):
+        for product in chunk["product_id"]:
+            if (candidate := _id(product)) is not None:
+                counts[candidate] += 1
+    if not counts:
+        raise ValueError("Past-A has no products for sampled-negative pool")
+    return [candidate for candidate, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))]
+
+
+def _sample_nonpositive_candidates(user: str, positive_ads: set[str], pool: Sequence[str], count: int, seed: int) -> list[str]:
+    """Deterministically sample training surrogates, never asserted negatives."""
+    if count <= 0:
+        return []
+    start = _stable(user, seed) % len(pool); sampled: list[str] = []
+    for offset in range(len(pool)):
+        candidate = pool[(start + offset) % len(pool)]
+        if candidate in positive_ads:
+            continue
+        sampled.append(candidate)
+        if len(sampled) >= count:
+            break
+    return sampled
 
 
 def assert_temporal_leakage_safe(past_path: Path, future_path: Path) -> None:

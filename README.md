@@ -114,6 +114,8 @@ PYTHONPATH=src python src/pipeline/run_coarse_rank.py --config config.yaml
 
 训练最多保留 `coarse_rank.max_train_rows`（默认 200 万）条样本；交互及商品属性写入临时 SQLite 索引，候选读取、特征查询和输出均流式执行。最终原子写入 `outputs/ranking/coarse_rank_topk.csv`，每个用户保留最多 50 条，按 `coarse_score DESC, rrf_score DESC, candidate_ad_id ASC` 排序。RRF 候选没有请求生成时刻，因此时间切分仅是可复现的离线基线，日志会明确提示这一限制。
 
+严格 temporal coarse 使用不同契约：`Past-A → history/statistics + sampled-negative pool`，`Past-B → 全部 observed clicked interactions 作为训练正样本`，`Future-A → recall candidate inventory evaluation`，`Future-B → 下游最终留出窗口`。Past-B 的正样本不会因为 Recall 未命中而丢弃；负例仅是从 Past-A popularity pool 抽取的 sampled non-positive candidates，不是曝光负例。`outputs/temporal/metrics/recall_diagnostics.json` 额外报告各路召回的 hit overlap、incremental coverage、RRF 对 popularity hits 的保留率，以及 Two Tower 的 seen/unseen ID cold-start 比例。
+
 ## Fine Ranking
 
 精排使用 PyTorch DCNv2 的共享 Cross/Deep backbone，并输出 click-conditioned
