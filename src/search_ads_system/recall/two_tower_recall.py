@@ -59,6 +59,7 @@ class TwoTowerRecallConfig:
     search_batch_size: int = 10_000
     inference_batch_size: int = 4096
     input_chunk_size: int = 200_000
+    max_train_rows: Optional[int] = None
 
 
 class TwoTowerModel(nn.Module):
@@ -216,6 +217,8 @@ def prepare_training_data(
     data["product_id"] = data["product_id"].astype("string").str.strip()
     valid = data[["user_id", "product_id"]].notna().all(axis=1) & data[["user_id", "product_id"]].ne("").all(axis=1)
     data = data.loc[valid].copy()
+    if config.max_train_rows is not None:
+        data = data.iloc[: config.max_train_rows].copy()
     labels = pd.to_numeric(data["conversion_label"], errors="raise")
     if not labels.isin([0, 1]).all():
         raise ValueError("conversion_label must be binary")
@@ -565,6 +568,8 @@ def _validate_config(config: TwoTowerRecallConfig) -> None:
         raise ValueError("recall.two_tower.faiss HNSW values must be greater than zero")
     if config.max_users is not None and config.max_users <= 0:
         raise ValueError("recall.two_tower.max_users must be greater than zero when set")
+    if config.max_train_rows is not None and config.max_train_rows <= 0:
+        raise ValueError("recall.two_tower.max_train_rows must be greater than zero when set")
 
 
 def _read_checkpoint(path: Path, device: torch.device) -> Mapping[str, Any]:
@@ -575,6 +580,17 @@ def _read_checkpoint(path: Path, device: torch.device) -> Mapping[str, Any]:
     if not isinstance(checkpoint, Mapping):
         raise ValueError("Two Tower checkpoint must be a mapping")
     return checkpoint
+
+
+def checkpoint_parameter_counts(path: Path) -> dict[str, int]:
+    """Read ID-only checkpoint capacity without constructing an inference run."""
+    checkpoint = _read_checkpoint(path, torch.device("cpu"))
+    state = checkpoint.get("state_dict", {})
+    if not isinstance(state, Mapping):
+        raise ValueError("Two Tower checkpoint is missing state_dict")
+    total = sum(int(value.numel()) for value in state.values() if isinstance(value, Tensor))
+    embedding = sum(int(value.numel()) for name, value in state.items() if "embedding" in name and isinstance(value, Tensor))
+    return {"total": total, "embedding": embedding, "dense": total - embedding}
 
 
 def _faiss_options(options: Mapping[str, Any]) -> Mapping[str, Any]:

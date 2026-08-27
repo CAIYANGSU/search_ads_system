@@ -308,6 +308,27 @@ temporal:
       top_k: 100
       popularity_min_quota: 25
       balanced_min_quota: 20
+    # Strict temporal content Two-Tower. A non-null catalogue must be a
+    # point-in-time product snapshot available by the end of Past; do not set
+    # this to split/future_a or split/future_b. Null is safest but cannot index
+    # products that were absent from Past interactions.
+    content_two_tower:
+      product_catalog_path: null
+      # Required when product_catalog_path is set: declared snapshot time at
+      # or before the Past boundary, never a Future-A/B-derived table.
+      product_catalog_as_of_timestamp: null
+      embedding_dim: 16
+      hidden_dim: 64
+      categorical_buckets: 4096
+      product_id_buckets: 65537
+      batch_size: 4096
+      epochs: 3
+      learning_rate: 0.001
+      negative_samples: 5
+      max_history_items: 100
+      sanity:
+        max_train_rows: 10000
+        epochs: 1
   coarse_rank:
     max_train_rows: 1000000
     top_k: 50

@@ -9,7 +9,9 @@ from search_ads_system.recall.itemcf_recall import ItemCFRecallConfig, generate_
 from search_ads_system.recall.popularity_recall import PopularityRecallConfig, generate_popularity_candidates, write_candidates as write_popularity
 from search_ads_system.recall.rrf_fusion import RRFFusionConfig, fuse_and_write_candidates
 from search_ads_system.recall.temporal_fusion import run_temporal_fusion_sweep
-from search_ads_system.recall.two_tower_recall import TwoTowerRecallConfig, run_two_tower_recall
+from search_ads_system.recall.two_tower_recall import TwoTowerRecallConfig, checkpoint_parameter_counts, run_two_tower_recall
+from search_ads_system.recall.content_two_tower import ContentTwoTowerConfig, content_checkpoint_parameter_counts, run_content_two_tower_recall
+from search_ads_system.recall.two_tower_content_audit import run_content_two_tower_diagnostics
 
 def _recall(raw, temporal):
     root=temporal.output_dir; past=root/'split'/'past'; candidates=root/'recall_candidates'; models=root/'models'; candidates.mkdir(parents=True,exist_ok=True); models.mkdir(parents=True,exist_ok=True)
@@ -58,8 +60,35 @@ def _fusion_sweep(raw, temporal):
         top_k=int(options.get('top_k',100)), popularity_quota=int(options.get('popularity_min_quota',25)), balanced_quota=int(options.get('balanced_min_quota',20)),
     )
 
+def _content_two_tower(raw, temporal, *, sanity=False):
+    """Train isolated content ablations from Past and evaluate Future-A only."""
+    root=temporal.output_dir; past=root/'split'/'past'; future_a=root/'split'/'future_a'; options=raw.get('temporal',{}).get('recall',{}).get('content_two_tower',{}); chosen={**options,**(options.get('sanity',{}) if sanity else {})}
+    if not future_a.exists():
+        from search_ads_system.evaluation.temporal import build_future_ab_split
+        build_future_ab_split(temporal)
+    namespace=(root/'sanity'/'two_tower_content') if sanity else root
+    candidates=namespace/'recall_candidates'; models=namespace/'models'; candidates.mkdir(parents=True,exist_ok=True); models.mkdir(parents=True,exist_ok=True)
+    dim=int(chosen.get('embedding_dim',16)); epochs=int(chosen.get('epochs',3)); max_rows=chosen.get('max_train_rows'); base=raw.get('recall',{}).get('two_tower',{})
+    id_config=TwoTowerRecallConfig(past,candidates/'two_tower_id_only_topk.csv',candidates/'faiss_id_only_product_index',models/'two_tower_id_only.pt',embedding_dim=dim,batch_size=int(chosen.get('batch_size',4096)),epochs=epochs,learning_rate=float(chosen.get('learning_rate',1e-3)),top_k=100,negative_samples=int(chosen.get('negative_samples',5)),seed=temporal.seed,device=str(base.get('device','auto')),train=not (models/'two_tower_id_only.pt').exists(),input_chunk_size=temporal.chunk_size,max_train_rows=None if max_rows is None else int(max_rows))
+    if not id_config.output_path.exists() or not id_config.checkpoint_path.exists():
+        run_two_tower_recall(id_config)
+    id_result={"checkpoint":str(id_config.checkpoint_path),"output":str(id_config.output_path),"variant":"id_only","parameter_counts":checkpoint_parameter_counts(id_config.checkpoint_path)}
+    catalogue=chosen.get('product_catalog_path'); catalogue_path=None if not catalogue else (Path(catalogue) if Path(catalogue).is_absolute() else Path.cwd()/str(catalogue))
+    catalogue_as_of=chosen.get('product_catalog_as_of_timestamp')
+    if catalogue_path is not None:
+        metadata=json.loads((root/'split'/'metadata.json').read_text(encoding='utf-8'))
+        if catalogue_as_of is None or int(catalogue_as_of)>int(metadata['split_timestamp']):
+            raise ValueError('content product catalogue must declare an as-of timestamp no later than the Past/Future split boundary')
+    runs={"id_only":id_result}
+    for variant,filename in (("content","two_tower_content"),("content_no_product_id","two_tower_content_no_product_id")):
+        config=ContentTwoTowerConfig(input_path=past,output_path=candidates/f'{filename}_topk.csv',index_path=candidates/("faiss_content_product_index" if variant=="content" else "faiss_content_no_product_id_index"),checkpoint_path=models/f'{filename}.pt',product_catalog_path=catalogue_path,catalog_as_of_timestamp=catalogue_as_of,variant=variant,embedding_dim=dim,hidden_dim=int(chosen.get('hidden_dim',64)),categorical_buckets=int(chosen.get('categorical_buckets',4096)),product_id_buckets=int(chosen.get('product_id_buckets',65537)),batch_size=int(chosen.get('batch_size',4096)),epochs=epochs,learning_rate=float(chosen.get('learning_rate',1e-3)),top_k=100,negative_samples=int(chosen.get('negative_samples',5)),max_history_items=int(chosen.get('max_history_items',100)),max_train_rows=None if max_rows is None else int(max_rows),seed=temporal.seed,device=str(base.get('device','auto')),train=not (models/f'{filename}.pt').exists(),input_chunk_size=temporal.chunk_size)
+        if not config.output_path.exists() or not config.checkpoint_path.exists(): run_content_two_tower_recall(config)
+        runs[variant]={"checkpoint":str(config.checkpoint_path),"output":str(config.output_path),"variant":variant,"parameter_counts":content_checkpoint_parameter_counts(config.checkpoint_path)}
+    if sanity: return {"runs":runs,"namespace":str(namespace),"future_b_read_for_model_selection":False}
+    return run_content_two_tower_diagnostics(past_path=past,future_a_path=future_a,itemcf_path=root/'recall_candidates'/'itemcf_topk.csv',popularity_path=root/'recall_candidates'/'popularity_topk.csv',id_only_path=id_config.output_path,content_path=candidates/'two_tower_content_topk.csv',content_no_product_id_path=candidates/'two_tower_content_no_product_id_topk.csv',output_dir=root/'metrics',chunk_size=temporal.chunk_size,model_runs=runs)
+
 def main()->None:
-    parser=argparse.ArgumentParser(); parser.add_argument("--config",type=Path,default=ROOT/"config.yaml"); parser.add_argument("--stage",choices=("split","itemcf","two_tower","popularity","rrf","evaluate_recall","fusion_sweep","coarse","all"),default="all"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument("--config",type=Path,default=ROOT/"config.yaml"); parser.add_argument("--stage",choices=("split","itemcf","two_tower","popularity","rrf","evaluate_recall","fusion_sweep","two_tower_content_sanity","two_tower_content","coarse","all"),default="all"); args=parser.parse_args()
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     path=args.config.resolve(); raw=load_yaml_config(path); temporal=parse_temporal_config(raw,path); result={}
     if args.stage in ('split','all'): result['split']=build_temporal_split(temporal)
@@ -70,6 +99,8 @@ def main()->None:
         result['recall_metrics']=_evaluate(raw,temporal)
     if args.stage == 'fusion_sweep':
         result['fusion_sweep']=_fusion_sweep(raw,temporal)
+    if args.stage == 'two_tower_content_sanity': result['two_tower_content_sanity']=_content_two_tower(raw,temporal,sanity=True)
+    if args.stage == 'two_tower_content': result['two_tower_content']=_content_two_tower(raw,temporal)
     if args.stage in ('coarse','all'):
         result['coarse_metrics']=run_temporal_coarse(temporal,max_train_rows=int(raw.get('temporal',{}).get('coarse_rank',{}).get('max_train_rows',2_000_000)),top_k=int(raw.get('temporal',{}).get('coarse_rank',{}).get('top_k',50)))
         target=temporal.output_dir/'metrics'; summary={'split':result.get('split',json.loads((temporal.output_dir/'split'/'metadata.json').read_text())),'pipeline':temporal_pipeline_diagnostics(temporal),'recall':result.get('recall_metrics',{}),'coarse':result['coarse_metrics'],'leakage':{'passed':True}}
