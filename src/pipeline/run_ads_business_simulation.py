@@ -95,17 +95,20 @@ def main() -> None:
     limit = options.get("max_rows"); limit = None if limit is None else int(limit)
     attribution, calibrated = _load_attribution(raw, config_path, args.stage, limit)
     attribution_report, policy, curve = simulate_attribution(attribution, config=simulation, calibrated_available=calibrated)
-    search_report: dict[str, Any] = {"available": False, "reason": "No standalone Search Conversion prediction artifact configured."}; search_path = options.get("search_prediction_path")
+    search_report: dict[str, Any] = {"available": False, "reason": "No standalone Search Conversion prediction artifact configured.", "future_b_read_for_search_conversion_simulation": False}; search_path = options.get("search_prediction_path")
     if search_path:
         search_frame = _read_parts(resolve_path(str(search_path), config_path.parent), limit)
-        search_report, search_curve = simulate_search_conversion(search_frame, config=simulation); search_curve["policy"] = "expected_value_per_click"
-        curve = pd.concat((curve, search_curve), ignore_index=True)
+        fractions = tuple(float(value) for value in options.get("search_selection_fractions", (.10, .25, .50, .75, 1.0)))
+        search_report, search_policy, search_deciles = simulate_search_conversion(search_frame, config=simulation, selection_fractions=fractions)
     output.joinpath("metrics").mkdir(parents=True, exist_ok=True); output.joinpath("tables").mkdir(parents=True, exist_ok=True)
     report = {"simulation_semantics": "synthetic_offline_simulation", **future_b_isolation_contract(), "cross_dataset_join": "not performed; Attribution and Search Conversion are simulated independently", "attribution": attribution_report, "search_conversion": search_report}
     (output / "metrics" / "auction_metrics.json").write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     (output / "metrics" / "auction_metrics.md").write_text(_markdown(report), encoding="utf-8")
     policy.to_csv(output / "tables" / "policy_comparison.csv", index=False); curve.to_csv(output / "tables" / "budget_curve.csv", index=False)
     pd.DataFrame([report["attribution"]["calibration_business_impact"]]).to_csv(output / "tables" / "calibration_business_impact.csv", index=False)
+    if search_path:
+        search_policy.to_csv(output / "tables" / "search_conversion_value_policy_comparison.csv", index=False)
+        search_deciles.to_csv(output / "tables" / "search_conversion_value_deciles.csv", index=False)
     print(json.dumps({"metrics": str(output / "metrics" / "auction_metrics.json"), "future_b_read_for_policy_selection": False}, indent=2))
 
 
@@ -116,6 +119,15 @@ def _markdown(report: Mapping[str, Any]) -> str:
             lines.append(f"- {name}: unavailable")
         else:
             lines.append(f"- {name}: spend={value['simulated_spend']}, win_rate={value['win_rate']}, CPA proxy={value['cpa_proxy']}")
+    search = report["search_conversion"]
+    lines.extend(("", "## Search Conversion standalone selection", ""))
+    if not search.get("available"):
+        lines.append(f"- unavailable: {search['reason']}")
+    else:
+        lines.append("- `clicked_interaction_value_selection_simulation`: capacity-constrained selection only; not an impression auction, spend, or ROI simulation.")
+        for policy, by_fraction in search["policies"].items():
+            full = by_fraction.get("100%")
+            if full: lines.append(f"- {policy} @100%: selected={full['selected_rows']}, value/click={full['actual_value_per_selected_click']}, value capture={full['value_capture_rate']}")
     return "\n".join(lines) + "\n"
 
 

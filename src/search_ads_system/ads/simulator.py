@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import numpy as np
@@ -69,16 +70,42 @@ def simulate_attribution(frame: pd.DataFrame, *, config: SimulationConfig, calib
     return {"bid_semantics": "synthetic_offline_simulation", "candidate_grouping": "synthetic deterministic random, label blind", "mechanism": config.mechanism, "policies": results, "calibration_business_impact": calibration_impact}, pd.DataFrame(comparison), pd.concat(curves, ignore_index=True) if curves else pd.DataFrame()
 
 
-def simulate_search_conversion(frame: pd.DataFrame, *, config: SimulationConfig) -> tuple[dict[str, Any], pd.DataFrame]:
-    """Standalone clicked-interaction value selection; never an impression auction."""
-    scored = search_value_scores(frame); grouped = group_candidates(scored, candidates_per_auction=config.candidates_per_auction, seed=config.seed)
-    bids = synthetic_bid("value_scaled", base_bid=config.base_bid, value_per_click=grouped.score_value_per_click.to_numpy(float)); grouped["synthetic_bid"] = bids
-    winners, curve = run_auction(grouped, quality_column="score_value_per_click", bid_column="synthetic_bid", mechanism=config.mechanism, budget=config.total_budget)
-    selected = grouped.loc[winners.loc[winners.won, "winner_row_index"].astype(int)] if len(winners) else grouped.iloc[:0]
-    actual = pd.to_numeric(selected.get("conversion_value_eur", pd.Series(0.0, index=selected.index)), errors="coerce").fillna(0.0)
-    total = pd.to_numeric(grouped.get("conversion_value_eur", pd.Series(0.0, index=grouped.index)), errors="coerce").fillna(0.0)
-    metrics = {"available": True, "definition": "clicked-interaction expected value selection; not impression-level auction ROI", "selected_clicks": int(len(selected)), "simulated_spend": float(winners.payment.sum()), "actual_value_captured": float(actual.sum()), "actual_value_per_click": float(actual.mean()) if len(actual) else None, "overall_actual_value_per_click": float(total.mean()) if len(total) else None, "value_per_click_lift": float(actual.mean() / total.mean()) if len(actual) and total.mean() else None, "budget_efficiency_proxy": float(actual.sum() / winners.payment.sum()) if winners.payment.sum() else None}
-    return metrics, curve
+def simulate_search_conversion(frame: pd.DataFrame, *, config: SimulationConfig, selection_fractions: tuple[float, ...] = (.10, .25, .50, .75, 1.0)) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    """Standalone clicked-interaction capacity selection, never an auction."""
+    scored = search_value_scores(frame)
+    required = {"conversion_label", "conversion_value_eur"}
+    if missing := required - set(scored): raise ValueError(f"Search selection input missing {sorted(missing)}")
+    if not selection_fractions or any(not 0 < value <= 1 for value in selection_fractions): raise ValueError("selection fractions must be in (0, 1]")
+    scores = {"random_baseline": None, "pCVR_clicked": "pCVR_clicked", "predicted_conditional_value": "predicted_conditional_value", "expected_value_per_click": "score_value_per_click"}
+    rng = np.random.default_rng(config.seed); random_order = rng.permutation(len(scored))
+    actual_value = pd.to_numeric(scored.conversion_value_eur, errors="coerce").fillna(0.0).clip(lower=0.0)
+    conversions = pd.to_numeric(scored.conversion_label, errors="coerce").fillna(0).astype(int)
+    total_value, total_conversions = float(actual_value.sum()), int(conversions.sum())
+    rows: list[dict[str, Any]] = []; nested: dict[str, Any] = {}
+    for fraction in selection_fractions:
+        capacity = min(len(scored), max(1, int(math.ceil(len(scored) * fraction))))
+        baseline: dict[str, Any] | None = None
+        for policy, column in scores.items():
+            positions = random_order[:capacity] if column is None else np.argsort(-pd.to_numeric(scored[column], errors="coerce").fillna(0.0).to_numpy(float), kind="stable")[:capacity]
+            selected_value, selected_conversion = actual_value.iloc[positions], conversions.iloc[positions]
+            metrics = {"policy": policy, "selection_fraction": fraction, "selected_rows": int(capacity), "observed_conversions": int(selected_conversion.sum()), "observed_conversion_rate": float(selected_conversion.mean()), "actual_conversion_value_sum": float(selected_value.sum()), "actual_value_per_selected_click": float(selected_value.mean()), "value_capture_rate": float(selected_value.sum() / total_value) if total_value else None, "conversion_capture_rate": float(selected_conversion.sum() / total_conversions) if total_conversions else None}
+            if baseline is None:
+                baseline = metrics
+            metrics["value_per_click_lift"] = float(metrics["actual_value_per_selected_click"] / baseline["actual_value_per_selected_click"]) if baseline["actual_value_per_selected_click"] else None
+            metrics["value_capture_lift"] = float(metrics["value_capture_rate"] / baseline["value_capture_rate"]) if baseline["value_capture_rate"] else None
+            rows.append(metrics); nested.setdefault(policy, {})[f"{int(fraction * 100)}%"] = metrics
+    deciles = _search_deciles(scored, conversions, actual_value, total_value)
+    report = {"available": True, "definition": "clicked_interaction_value_selection_simulation; capacity-constrained Top-K selection, not impression-level bidding, auction, spend, or ROI", "selection_capacity_semantics": "fractions are allowed clicked-interaction selection capacity, not advertiser monetary budgets", "future_b_read_for_search_conversion_simulation": False, "overall_rows": int(len(scored)), "overall_actual_conversion_value": total_value, "overall_observed_conversions": total_conversions, "policies": nested}
+    return report, pd.DataFrame(rows), deciles
+
+
+def _search_deciles(scored: pd.DataFrame, conversions: pd.Series, actual_value: pd.Series, total_value: float) -> pd.DataFrame:
+    order = np.argsort(-scored.score_value_per_click.to_numpy(float), kind="stable")
+    groups = np.array_split(order, 10); cumulative = 0.0; rows: list[dict[str, Any]] = []
+    for index, group in enumerate(groups, 1):
+        value = float(actual_value.iloc[group].sum()); cumulative += value
+        rows.append({"decile": index, "decile_order": "1=highest predicted expected_value_per_click", "rows": int(len(group)), "predicted_score_mean": float(scored.score_value_per_click.iloc[group].mean()) if len(group) else None, "actual_CVR": float(conversions.iloc[group].mean()) if len(group) else None, "actual_value_per_click": float(actual_value.iloc[group].mean()) if len(group) else None, "cumulative_value_capture": cumulative / total_value if total_value else None})
+    return pd.DataFrame(rows)
 
 
 def _attribution_metrics(candidates: pd.DataFrame, winners: pd.DataFrame, budget: float) -> dict[str, Any]:

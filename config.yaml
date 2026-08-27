@@ -375,6 +375,12 @@ fine_rank_multitask:
       max_diagnostic_rows: 100000
       epochs: 1
       batch_size: 4096
+  predictions:
+    checkpoint: outputs/fine_rank/models/dcnv2.pt
+    output_dir: outputs/fine_rank/predictions/future_a_predictions
+    max_rows: null
+    sanity:
+      max_rows: 100000
 
 ranking:
   model: deepfm
@@ -405,7 +411,8 @@ business_simulation:
   # Optional standalone clicked-interaction predictions. Expected columns:
   # pCVR_clicked, predicted_conditional_value, conversion_value_eur.
   # This input is never joined with Attribution rows.
-  search_prediction_path: null
+  search_prediction_path: outputs/fine_rank/predictions/future_a_predictions
+  search_selection_fractions: [0.10, 0.25, 0.50, 0.75, 1.0]
   sanity:
     max_rows: 100000
 
