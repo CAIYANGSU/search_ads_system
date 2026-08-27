@@ -81,11 +81,13 @@ training:
 
 recall:
   model: itemcf
-  top_k: 200
+  # Formal advertising funnel: each route supplies a Top1000 inventory, then
+  # the fixed development-selected weighted RRF produces Recall Top1000.
+  top_k: 1000
   popularity:
     input_path: outputs/processed/criteo_unified
     output_path: outputs/recall_candidates/popularity_topk.csv
-    top_k: 200
+    top_k: 1000
     click_weight: 1.0
     conversion_weight: 3.0
     chunk_size: 200000
@@ -98,7 +100,7 @@ recall:
     batch_size: 4096
     epochs: 3
     learning_rate: 0.001
-    top_k: 100
+    top_k: 1000
     max_users: 500000
     negative_samples: 5
     interaction_weights:
@@ -124,6 +126,7 @@ recall:
     user_id_column: user_id
     item_id_column: product_id
     interaction_label_column: conversion_label
+    top_k: 1000
     # Every input row is a click interaction in the unified Criteo data. A
     # conversion receives more weight while non-converting clicks remain valid
     # implicit-feedback interactions.
@@ -142,13 +145,13 @@ recall:
     candidate_generation:
       user_batch_size: 10000
   rrf:
-    k: 60
-    output_path: outputs/recall_candidates/fused_candidates.csv
+    k: 100
+    output_path: outputs/recall_candidates/fused_top1000.csv
     weights:
-      itemcf: 1.0
+      itemcf: 2.0
       two_tower: 1.0
-      popularity: 0.5
-    top_k_per_user: 100
+      popularity: 2.0
+    top_k_per_user: 1000
     max_users: 500000
 
 prerank:
@@ -158,14 +161,14 @@ prerank:
 coarse_rank:
   # Preserve and reuse the existing sklearn HistGBDT checkpoint by default.
   model_type: hist_gbdt
-  input_path: outputs/recall_candidates/fused_candidates.csv
+  input_path: outputs/recall_candidates/fused_top1000.csv
   interaction_path: outputs/processed/criteo_unified
   output_path: outputs/ranking/coarse_rank_topk.csv
   model_path: outputs/models/coarse_rank_model.pkl
   train: true
   max_train_rows: 2000000
   max_users: 500000
-  top_k: 50
+  top_k: 100
   chunk_size: 200000
   random_seed: 2026
   negative_sampling:
@@ -298,10 +301,12 @@ temporal:
       temporal_experiment_epochs: [1, 3, 5]
       temporal_prior_smoothing: 20.0
   recall:
-    itemcf_top_k: 100
-    two_tower_top_k: 100
-    popularity_top_k: 200
-    rrf_top_k: 100
+    # Formal strict-temporal funnel parameters. fusion_sweep remains a frozen
+    # experiment record and is not run by the funnel stages.
+    itemcf_top_k: 1000
+    two_tower_top_k: 1000
+    popularity_top_k: 1000
+    rrf_top_k: 1000
     # Independent, Future-A-only fusion development. This does not overwrite
     # fused_candidates.csv or formal production RRF parameters.
     fusion_sweep:
@@ -331,4 +336,4 @@ temporal:
         epochs: 1
   coarse_rank:
     max_train_rows: 1000000
-    top_k: 50
+    top_k: 100

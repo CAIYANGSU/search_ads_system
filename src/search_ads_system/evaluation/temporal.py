@@ -291,7 +291,7 @@ def run_temporal_coarse(config: TemporalConfig, *, max_train_rows:int=2_000_000,
     negative.  Future-A is candidate-inventory evaluation only; Future-B is
     untouched by this coarse training contract.
     """
-    future_ab = build_future_ab_split(config); past_ab = build_past_ab_split(config); root=config.output_dir; fused=root/'recall_candidates'/'fused_candidates.csv'; past_a=root/'split'/'past_a'; past_b=root/'split'/'past_b'; future_a=root/'split'/'future_a'
+    future_ab = build_future_ab_split(config); past_ab = build_past_ab_split(config); root=config.output_dir; fused=root/'recall_candidates'/'formal_top1000'/'fused_top1000.csv'; past_a=root/'split'/'past_a'; past_b=root/'split'/'past_b'; future_a=root/'split'/'future_a'
     if not fused.exists(): raise FileNotFoundError(f'Build temporal RRF first: {fused}')
     train_positives = _future_positives(past_b, config.chunk_size); train_conversions = _future_conversion_positives(past_b, config.chunk_size); evaluation_positives = _future_positives(future_a, config.chunk_size)
     popularity_pool = _past_popularity_pool(past_a, config.chunk_size)

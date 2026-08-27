@@ -161,7 +161,7 @@ def test_revised_temporal_coarse_uses_past_b_observed_clicks_without_recall_hit(
     config=TemporalConfig(source,tmp_path/'outputs'/'temporal',past_ratio=.5,max_users=10,chunk_size=10)
     build_temporal_split(config); past_ab=build_past_ab_split(config)
     assert past_ab['past_a']['time_max'] < past_ab['past_b']['time_min']
-    candidates=config.output_dir/'recall_candidates'/'fused_candidates.csv'; candidates.parent.mkdir(parents=True)
+    candidates=config.output_dir/'recall_candidates'/'formal_top1000'/'fused_top1000.csv'; candidates.parent.mkdir(parents=True)
     # Deliberately omit Past-B products c/d: revised training must still use them.
     pd.DataFrame([('u1','g',.9,1),('u1','a',.8,1)],columns=['user_id','candidate_ad_id','rrf_score','source_count']).to_csv(candidates,index=False)
     metrics=run_temporal_coarse(config,max_train_rows=100,top_k=10,negatives_per_positive=1)

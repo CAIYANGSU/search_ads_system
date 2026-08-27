@@ -14,7 +14,8 @@ from search_ads_system.recall.content_two_tower import ContentTwoTowerConfig, co
 from search_ads_system.recall.two_tower_content_audit import run_content_two_tower_diagnostics
 
 def _recall(raw, temporal):
-    root=temporal.output_dir; past=root/'split'/'past'; candidates=root/'recall_candidates'; models=root/'models'; candidates.mkdir(parents=True,exist_ok=True); models.mkdir(parents=True,exist_ok=True)
+    # New formal artifacts leave historical sweep/diagnostic candidates intact.
+    root=temporal.output_dir; past=root/'split'/'past'; candidates=root/'recall_candidates'/'formal_top1000'; models=root/'models'/'formal_top1000'; candidates.mkdir(parents=True,exist_ok=True); models.mkdir(parents=True,exist_ok=True)
     options=raw.get('temporal',{}).get('recall',{}); base=raw.get('recall',{})
     item=ItemCFRecallConfig(past,candidates/'itemcf_topk.csv','user_id','product_id','conversion_label',int(options.get('itemcf_top_k',100)),{'0':1.,'1':3.},1.,'sum','cosine',temporal.chunk_size,False,None,temporal.seed,10_000)
     if not item.output_path.exists():
@@ -29,11 +30,14 @@ def _recall(raw, temporal):
     if not two.output_path.exists():
         logging.info('%s temporal Two Tower using Past only', 'Training' if two.train else 'Reusing checkpoint for'); run_two_tower_recall(two)
     else: logging.info('Reusing temporal Two Tower candidates: %s',two.output_path)
-    rrf=RRFFusionConfig(item.output_path,two.output_path,pop.output_path,candidates/'fused_candidates.csv',k=60,weights={'itemcf':1.,'two_tower':1.,'popularity':.5},top_k_per_user=int(options.get('rrf_top_k',100)),max_users=temporal.max_users,chunk_size=temporal.chunk_size)
+    # Frozen Future-A selection: fixed production RRF, not a new sweep.
+    rrf=RRFFusionConfig(item.output_path,two.output_path,pop.output_path,candidates/'fused_top1000.csv',k=100,weights={'itemcf':2.,'two_tower':1.,'popularity':2.},top_k_per_user=int(options.get('rrf_top_k',1000)),max_users=temporal.max_users,chunk_size=temporal.chunk_size)
     if not rrf.output_path.exists(): fuse_and_write_candidates(rrf)
     else: logging.info('Reusing temporal RRF: %s',rrf.output_path)
 
 def _evaluate(raw, temporal):
+    # This stage intentionally reads frozen historical diagnostic artifacts.
+    # The formal Top1000 funnel is run by --stage funnel.
     paths=temporal.output_dir/'recall_candidates'; future=temporal.output_dir/'split'/'future'; metrics={}
     for name in ('itemcf','two_tower','popularity','fused'):
         path=paths/f'{name}_topk.csv' if name!='fused' else paths/'fused_candidates.csv'
@@ -88,11 +92,11 @@ def _content_two_tower(raw, temporal, *, sanity=False):
     return run_content_two_tower_diagnostics(past_path=past,future_a_path=future_a,itemcf_path=root/'recall_candidates'/'itemcf_topk.csv',popularity_path=root/'recall_candidates'/'popularity_topk.csv',id_only_path=id_config.output_path,content_path=candidates/'two_tower_content_topk.csv',content_no_product_id_path=candidates/'two_tower_content_no_product_id_topk.csv',output_dir=root/'metrics',chunk_size=temporal.chunk_size,model_runs=runs)
 
 def main()->None:
-    parser=argparse.ArgumentParser(); parser.add_argument("--config",type=Path,default=ROOT/"config.yaml"); parser.add_argument("--stage",choices=("split","itemcf","two_tower","popularity","rrf","evaluate_recall","fusion_sweep","two_tower_content_sanity","two_tower_content","coarse","all"),default="all"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument("--config",type=Path,default=ROOT/"config.yaml"); parser.add_argument("--stage",choices=("split","itemcf","two_tower","popularity","rrf","evaluate_recall","fusion_sweep","two_tower_content_sanity","two_tower_content","coarse","funnel","all"),default="all"); args=parser.parse_args()
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     path=args.config.resolve(); raw=load_yaml_config(path); temporal=parse_temporal_config(raw,path); result={}
     if args.stage in ('split','all'): result['split']=build_temporal_split(temporal)
-    if args.stage in ('itemcf','two_tower','popularity','rrf','all'):
+    if args.stage in ('itemcf','two_tower','popularity','rrf','funnel','all'):
         if not (temporal.output_dir/'split'/'metadata.json').exists(): build_temporal_split(temporal)
         _recall(raw,temporal); result['recall']='complete'
     if args.stage in ('evaluate_recall','all'):
@@ -105,5 +109,7 @@ def main()->None:
         result['coarse_metrics']=run_temporal_coarse(temporal,max_train_rows=int(raw.get('temporal',{}).get('coarse_rank',{}).get('max_train_rows',2_000_000)),top_k=int(raw.get('temporal',{}).get('coarse_rank',{}).get('top_k',50)))
         target=temporal.output_dir/'metrics'; summary={'split':result.get('split',json.loads((temporal.output_dir/'split'/'metadata.json').read_text())),'pipeline':temporal_pipeline_diagnostics(temporal),'recall':result.get('recall_metrics',{}),'coarse':result['coarse_metrics'],'leakage':{'passed':True}}
         (target/'temporal_experiment_summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True),encoding='utf-8')
+    if args.stage == 'funnel':
+        result['coarse_metrics']=run_temporal_coarse(temporal,max_train_rows=int(raw.get('temporal',{}).get('coarse_rank',{}).get('max_train_rows',2_000_000)),top_k=int(raw.get('temporal',{}).get('coarse_rank',{}).get('top_k',100)))
     print(json.dumps(result,indent=2,sort_keys=True))
 if __name__=="__main__": main()

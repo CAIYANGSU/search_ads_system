@@ -106,15 +106,29 @@ EDA 使用分块累积统计，输出总体行数、转化数/转化率、每列
 
 ## Coarse Ranking
 
-粗排读取 RRF 的 `fused_candidates.csv`，以真实的 `(user_id, product_id)` 点击交互作为正样本、同一用户未交互的候选作为确定性采样负样本，并把转换样本的训练权重提高到 3。`conversion_label`、转换金额、转换延迟、时间戳和 ID 都不会作为模型特征。第一版采用 CPU 友好的 `HistGradientBoostingClassifier`，输入为 RRF 分数/来源数、商品价格/近 7 日点击数及稳定哈希后的低成本商品属性。
+粗排读取 RRF 的 `fused_top1000.csv`，以真实的 `(user_id, product_id)` 点击交互作为正样本、同一用户未交互的候选作为确定性采样负样本，并把转换样本的训练权重提高到 3。`conversion_label`、转换金额、转换延迟、时间戳和 ID 都不会作为模型特征。第一版采用 CPU 友好的 `HistGradientBoostingClassifier`，输入为 RRF 分数/来源数、商品价格/近 7 日点击数及稳定哈希后的低成本商品属性。
 
 ```bash
 PYTHONPATH=src python src/pipeline/run_coarse_rank.py --config config.yaml
 ```
 
-训练最多保留 `coarse_rank.max_train_rows`（默认 200 万）条样本；交互及商品属性写入临时 SQLite 索引，候选读取、特征查询和输出均流式执行。最终原子写入 `outputs/ranking/coarse_rank_topk.csv`，每个用户保留最多 50 条，按 `coarse_score DESC, rrf_score DESC, candidate_ad_id ASC` 排序。RRF 候选没有请求生成时刻，因此时间切分仅是可复现的离线基线，日志会明确提示这一限制。
+## 正式广告漏斗
 
-严格 temporal coarse 使用不同契约：`Past-A → history/statistics + sampled-negative pool`，`Past-B → 全部 observed clicked interactions 作为训练正样本`，`Future-A → recall candidate inventory evaluation`，`Future-B → 下游最终留出窗口`。Past-B 的正样本不会因为 Recall 未命中而丢弃；负例仅是从 Past-A popularity pool 抽取的 sampled non-positive candidates，不是曝光负例。`outputs/temporal/metrics/recall_diagnostics.json` 额外报告各路召回的 hit overlap、incremental coverage、RRF 对 popularity hits 的保留率，以及 Two Tower 的 seen/unseen ID cold-start 比例。
+`ItemCF + Two-Tower + Popularity → weighted RRF Top1000 → Coarse Top100 → Fine Rank Top20`
+
+正式 RRF 固定使用 `rrf_k=100`、权重 `ItemCF=2 / Two-Tower=1 / Popularity=2`，输出 `outputs/recall_candidates/fused_top1000.csv`。它来自已经完成的 temporal development selection；正式运行不会再执行 fusion sweep。full artifacts 位于 `outputs/`，strict-temporal artifacts 位于 `outputs/temporal/`（正式 temporal candidates 位于 `outputs/temporal/recall_candidates/formal_top1000/`），两者不会复用 checkpoint、candidate 或 ranking 输出。
+
+Coarse 输入 Recall Top1000，输出 `outputs/ranking/coarse_rank_topk.csv` 的每用户 Top100，按 `coarse_score DESC, rrf_score DESC, candidate_ad_id ASC` 排序。训练最多保留 `coarse_rank.max_train_rows`（默认 200 万）条样本；交互及商品属性写入临时 SQLite 索引，候选读取、特征查询和输出均流式执行。full Coarse 输出 ROC-AUC、PR-AUC、LogLoss 和 Top100 positive retention。
+
+```bash
+# Full/IID reference funnel
+PYTHONPATH=src python src/pipeline/run_ads_funnel.py --config config.yaml --stage all
+
+# Strict temporal formal funnel (Past-A/B coarse contract)
+PYTHONPATH=src python src/pipeline/run_temporal_experiment.py --config config.yaml --stage funnel
+```
+
+严格 temporal coarse 使用不同契约：`Past-A → history/statistics + sampled-negative pool`，`Past-B → 全部 observed clicked interactions 作为训练正样本`，`Future-A → recall candidate inventory evaluation`，`Future-B → 下游最终留出窗口`。Past-B 的正样本不会因为 Recall 未命中而丢弃；负例仅是从 Past-A popularity pool 抽取的 sampled non-positive candidates，不是曝光负例。temporal Coarse 同样读取 temporal RRF Top1000 并输出 Top100，以及 ROC-AUC、PR-AUC、LogLoss 与 Top100 retention。`outputs/temporal/metrics/recall_diagnostics.json` 等历史 diagnostics 保留为实验记录。
 
 ## Fine Ranking
 
