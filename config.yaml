@@ -116,6 +116,43 @@ attribution_preprocessing:
     past_ratio: 0.8
     future_a_ratio: 0.5
 
+# Attribution-only standard ESMM experiment. It reads Past for fitting/training
+# and Future-A for development evaluation; no option or path exposes Future-B.
+attribution_esmm:
+  enabled: true
+  seed: 2026
+  device: auto
+  embedding_dim: 16
+  hash_buckets:
+    user_id: 1048576
+    campaign_id: 262144
+    categories: 262144
+  shared_hidden_dims: [256, 128]
+  ctr_hidden_dims: [128, 64]
+  cvr_hidden_dims: [128, 64]
+  batch_size: 8192
+  inference_batch_size: 32768
+  io_chunk_size: 200000
+  epochs: 3
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  lambda_ctcvr: 1.0
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  mixed_precision: true
+  # null means the whole respective split. Limits select deterministic leading
+  # rows in the split and are for bounded development, not random tuning.
+  max_train_rows: null
+  max_validation_rows: null
+  early_stopping_patience: 1
+  checkpoint_dir: outputs/attribution/models
+  metrics_dir: outputs/attribution/metrics
+  sanity:
+    max_train_rows: 200000
+    max_validation_rows: 100000
+    epochs: 1
+
 training:
   batch_size: 512
   learning_rate: 0.001
