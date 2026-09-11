@@ -508,27 +508,51 @@ temporal:
       top_k: 100
       popularity_min_quota: 25
       balanced_min_quota: 20
-    # Strict temporal content Two-Tower. A non-null catalogue must be a
-    # point-in-time product snapshot available by the end of Past; do not set
-    # this to split/future_a or split/future_b. Null is safest but cannot index
-    # products that were absent from Past interactions.
-    content_two_tower:
+    # Strict-temporal, history-free Item Tower ablation. Both variants use the
+    # same ID-only User Tower and sampled-negative objective. A non-null product
+    # catalogue must be a point-in-time snapshot available by the end of Past.
+    content_item_two_tower:
       product_catalog_path: null
-      # Required when product_catalog_path is set: declared snapshot time at
-      # or before the Past boundary, never a Future-A/B-derived table.
       product_catalog_as_of_timestamp: null
-      embedding_dim: 16
-      hidden_dim: 64
-      categorical_buckets: 4096
-      product_id_buckets: 65537
+      enabled_features:
+        - product_id
+        - product_brand
+        - product_category_1
+        - product_category_2
+        - product_category_3
+        - product_category_4
+        - partner_id
+        - product_price
+      embedding_dim: 32
+      feature_embedding_dim: 16
+      price_embedding_dim: 4
+      hidden_dims: [128, 64]
       batch_size: 4096
       epochs: 3
       learning_rate: 0.001
       negative_samples: 5
-      max_history_items: 100
+      click_weight: 1.0
+      conversion_weight: 3.0
+      top_k: 200
+      exclude_seen_items: true
+      retrieval_oversample_ratio: 2.0
+      search_batch_size: 10000
+      inference_batch_size: 4096
+      history_cache_users: 20000
+      log_every_rows: 200000
+      train: true
+      faiss:
+        index_type: hnsw
+        hnsw_m: 32
+        ef_construction: 200
+        ef_search: 64
       sanity:
         max_train_rows: 10000
         epochs: 1
+        top_k: 50
+        search_batch_size: 1000
+        faiss:
+          index_type: flat
   coarse_rank:
     max_train_rows: 1000000
     top_k: 100

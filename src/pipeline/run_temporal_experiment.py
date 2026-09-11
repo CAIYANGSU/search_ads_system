@@ -10,9 +10,8 @@ from search_ads_system.recall.itemcf_recall import ItemCFRecallConfig, generate_
 from search_ads_system.recall.popularity_recall import PopularityRecallConfig, generate_popularity_candidates, write_candidates as write_popularity
 from search_ads_system.recall.rrf_fusion import RRFFusionConfig, fuse_and_write_candidates
 from search_ads_system.recall.temporal_fusion import run_temporal_fusion_sweep
-from search_ads_system.recall.two_tower_recall import TwoTowerRecallConfig, checkpoint_parameter_counts, run_two_tower_recall
-from search_ads_system.recall.content_two_tower import ContentTwoTowerConfig, content_checkpoint_parameter_counts, run_content_two_tower_recall
-from search_ads_system.recall.two_tower_content_audit import run_content_two_tower_diagnostics
+from search_ads_system.recall.two_tower_recall import TwoTowerRecallConfig, run_two_tower_recall
+from search_ads_system.recall.content_item_two_tower import ContentItemTwoTowerConfig, run_content_item_ablation
 
 def _recall(raw, temporal):
     # New formal artifacts leave historical sweep/diagnostic candidates intact.
@@ -66,34 +65,29 @@ def _fusion_sweep(raw, temporal):
     )
 
 def _content_two_tower(raw, temporal, *, sanity=False):
-    """Train isolated content ablations from Past and evaluate Future-A only."""
-    root=temporal.output_dir; past=root/'split'/'past'; future_a=root/'split'/'future_a'; options=raw.get('temporal',{}).get('recall',{}).get('content_two_tower',{}); chosen={**options,**(options.get('sanity',{}) if sanity else {})}
+    """Run the history-free ID-only versus content-item Future-A ablation."""
+    root=temporal.output_dir; past=root/'split'/'past'; future_a=root/'split'/'future_a'; recall_options=raw.get('temporal',{}).get('recall',{}); options=recall_options.get('content_item_two_tower',recall_options.get('content_two_tower',{})); chosen={**options,**(options.get('sanity',{}) if sanity else {})}
     if not future_a.exists():
         from search_ads_system.evaluation.temporal import build_future_ab_split
         build_future_ab_split(temporal)
-    namespace=(root/'sanity'/'two_tower_content') if sanity else root
-    candidates=namespace/'recall_candidates'; models=namespace/'models'; candidates.mkdir(parents=True,exist_ok=True); models.mkdir(parents=True,exist_ok=True)
-    dim=int(chosen.get('embedding_dim',16)); epochs=int(chosen.get('epochs',3)); max_rows=chosen.get('max_train_rows'); base=raw.get('recall',{}).get('two_tower',{})
-    id_config=TwoTowerRecallConfig(past,candidates/'two_tower_id_only_topk.csv',candidates/'faiss_id_only_product_index',models/'two_tower_id_only.pt',embedding_dim=dim,batch_size=int(chosen.get('batch_size',4096)),epochs=epochs,learning_rate=float(chosen.get('learning_rate',1e-3)),top_k=100,negative_samples=int(chosen.get('negative_samples',5)),seed=temporal.seed,device=str(base.get('device','auto')),train=not (models/'two_tower_id_only.pt').exists(),input_chunk_size=temporal.chunk_size,max_train_rows=None if max_rows is None else int(max_rows))
-    if not id_config.output_path.exists() or not id_config.checkpoint_path.exists():
-        run_two_tower_recall(id_config)
-    id_result={"checkpoint":str(id_config.checkpoint_path),"output":str(id_config.output_path),"variant":"id_only","parameter_counts":checkpoint_parameter_counts(id_config.checkpoint_path)}
-    catalogue=chosen.get('product_catalog_path'); catalogue_path=None if not catalogue else (Path(catalogue) if Path(catalogue).is_absolute() else Path.cwd()/str(catalogue))
+    namespace=(root/'sanity'/'content_item_two_tower') if sanity else root
+    catalogue=chosen.get('product_catalog_path'); catalogue_path=None if not catalogue else (Path(catalogue) if Path(catalogue).is_absolute() else ROOT/str(catalogue))
     catalogue_as_of=chosen.get('product_catalog_as_of_timestamp')
-    if catalogue_path is not None:
-        metadata=json.loads((root/'split'/'metadata.json').read_text(encoding='utf-8'))
-        if catalogue_as_of is None or int(catalogue_as_of)>int(metadata['split_timestamp']):
-            raise ValueError('content product catalogue must declare an as-of timestamp no later than the Past/Future split boundary')
-    runs={"id_only":id_result}
-    for variant,filename in (("content","two_tower_content"),("content_no_product_id","two_tower_content_no_product_id")):
-        config=ContentTwoTowerConfig(input_path=past,output_path=candidates/f'{filename}_topk.csv',index_path=candidates/("faiss_content_product_index" if variant=="content" else "faiss_content_no_product_id_index"),checkpoint_path=models/f'{filename}.pt',product_catalog_path=catalogue_path,catalog_as_of_timestamp=catalogue_as_of,variant=variant,embedding_dim=dim,hidden_dim=int(chosen.get('hidden_dim',64)),categorical_buckets=int(chosen.get('categorical_buckets',4096)),product_id_buckets=int(chosen.get('product_id_buckets',65537)),batch_size=int(chosen.get('batch_size',4096)),epochs=epochs,learning_rate=float(chosen.get('learning_rate',1e-3)),top_k=100,negative_samples=int(chosen.get('negative_samples',5)),max_history_items=int(chosen.get('max_history_items',100)),max_train_rows=None if max_rows is None else int(max_rows),seed=temporal.seed,device=str(base.get('device','auto')),train=not (models/f'{filename}.pt').exists(),input_chunk_size=temporal.chunk_size)
-        if not config.output_path.exists() or not config.checkpoint_path.exists(): run_content_two_tower_recall(config)
-        runs[variant]={"checkpoint":str(config.checkpoint_path),"output":str(config.output_path),"variant":variant,"parameter_counts":content_checkpoint_parameter_counts(config.checkpoint_path)}
-    if sanity: return {"runs":runs,"namespace":str(namespace),"future_b_read_for_model_selection":False}
-    return run_content_two_tower_diagnostics(past_path=past,future_a_path=future_a,itemcf_path=root/'recall_candidates'/'itemcf_topk.csv',popularity_path=root/'recall_candidates'/'popularity_topk.csv',id_only_path=id_config.output_path,content_path=candidates/'two_tower_content_topk.csv',content_no_product_id_path=candidates/'two_tower_content_no_product_id_topk.csv',output_dir=root/'metrics',chunk_size=temporal.chunk_size,model_runs=runs)
+    metadata=json.loads((root/'split'/'metadata.json').read_text(encoding='utf-8'))
+    base=raw.get('recall',{}).get('two_tower',{}); faiss=chosen.get('faiss',{})
+    config=ContentItemTwoTowerConfig(
+        input_path=past,future_path=future_a,output_dir=namespace,split_timestamp=int(metadata['split_timestamp']),
+        product_catalog_path=catalogue_path,product_catalog_as_of_timestamp=None if catalogue_as_of is None else int(catalogue_as_of),
+        enabled_features=tuple(chosen.get('enabled_features',('product_id','product_brand','product_category_1','product_category_2','product_category_3','product_category_4','partner_id','product_price'))),
+        embedding_dim=int(chosen.get('embedding_dim',32)),feature_embedding_dim=int(chosen.get('feature_embedding_dim',16)),price_embedding_dim=int(chosen.get('price_embedding_dim',4)),hidden_dims=tuple(int(value) for value in chosen.get('hidden_dims',(128,64))),
+        batch_size=int(chosen.get('batch_size',4096)),epochs=int(chosen.get('epochs',3)),learning_rate=float(chosen.get('learning_rate',1e-3)),negative_samples=int(chosen.get('negative_samples',5)),click_weight=float(chosen.get('click_weight',1.0)),conversion_weight=float(chosen.get('conversion_weight',3.0)),
+        max_train_rows=None if chosen.get('max_train_rows') is None else int(chosen['max_train_rows']),top_k=int(chosen.get('top_k',200)),exclude_seen_items=bool(chosen.get('exclude_seen_items',True)),retrieval_oversample_ratio=float(chosen.get('retrieval_oversample_ratio',2.0)),search_batch_size=int(chosen.get('search_batch_size',10000)),inference_batch_size=int(chosen.get('inference_batch_size',4096)),input_chunk_size=temporal.chunk_size,log_every_rows=int(chosen.get('log_every_rows',200000)),history_cache_users=int(chosen.get('history_cache_users',20000)),seed=temporal.seed,device=str(base.get('device','auto')),
+        faiss_index_type=str(faiss.get('index_type',chosen.get('faiss_index_type','hnsw'))),hnsw_m=int(faiss.get('hnsw_m',32)),ef_construction=int(faiss.get('ef_construction',200)),ef_search=int(faiss.get('ef_search',64)),train=bool(chosen.get('train',True)),
+    )
+    return run_content_item_ablation(config)
 
 def main()->None:
-    parser=argparse.ArgumentParser(); parser.add_argument("--config",type=Path,default=ROOT/"config.yaml"); parser.add_argument("--stage",choices=("split","itemcf","two_tower","popularity","rrf","evaluate_recall","fusion_sweep","two_tower_content_sanity","two_tower_content","coarse","funnel","all"),default="all"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument("--config",type=Path,default=ROOT/"config.yaml"); parser.add_argument("--stage",choices=("split","itemcf","two_tower","popularity","rrf","evaluate_recall","fusion_sweep","content_item_two_tower_sanity","content_item_two_tower","two_tower_content_sanity","two_tower_content","coarse","funnel","all"),default="all"); args=parser.parse_args()
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     path=args.config.resolve()
     if warning := future_b_opened_warning(path): logging.warning(warning)
@@ -106,8 +100,8 @@ def main()->None:
         result['recall_metrics']=_evaluate(raw,temporal)
     if args.stage == 'fusion_sweep':
         result['fusion_sweep']=_fusion_sweep(raw,temporal)
-    if args.stage == 'two_tower_content_sanity': result['two_tower_content_sanity']=_content_two_tower(raw,temporal,sanity=True)
-    if args.stage == 'two_tower_content': result['two_tower_content']=_content_two_tower(raw,temporal)
+    if args.stage in ('content_item_two_tower_sanity','two_tower_content_sanity'): result['content_item_two_tower_sanity']=_content_two_tower(raw,temporal,sanity=True)
+    if args.stage in ('content_item_two_tower','two_tower_content'): result['content_item_two_tower']=_content_two_tower(raw,temporal)
     if args.stage in ('coarse','all'):
         result['coarse_metrics']=run_temporal_coarse(temporal,max_train_rows=int(raw.get('temporal',{}).get('coarse_rank',{}).get('max_train_rows',2_000_000)),top_k=int(raw.get('temporal',{}).get('coarse_rank',{}).get('top_k',50)))
         target=temporal.output_dir/'metrics'; summary={'split':result.get('split',json.loads((temporal.output_dir/'split'/'metadata.json').read_text())),'pipeline':temporal_pipeline_diagnostics(temporal),'recall':result.get('recall_metrics',{}),'coarse':result['coarse_metrics'],'leakage':{'passed':True}}

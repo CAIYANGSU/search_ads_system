@@ -166,6 +166,31 @@ PYTHONPATH=src python src/pipeline/run_temporal_experiment.py --config config.ya
 
 严格 temporal coarse 使用不同契约：`Past-A → history/statistics + sampled-negative pool`，`Past-B → 全部 observed clicked interactions 作为训练正样本`，`Future-A → recall candidate inventory evaluation`，`Future-B → 下游最终留出窗口`。Past-B 的正样本不会因为 Recall 未命中而丢弃；负例仅是从 Past-A popularity pool 抽取的 sampled non-positive candidates，不是曝光负例。temporal Coarse 同样读取 temporal RRF Top1000 并输出 Top100，以及 ROC-AUC、PR-AUC、LogLoss 与 Top100 retention。`outputs/temporal/metrics/recall_diagnostics.json` 等历史 diagnostics 保留为实验记录。
 
+### Strict-temporal Content Item Tower ablation
+
+`content_item_two_tower` 是独立的两行公平消融：`id_only` 与
+`content_item` 共用 ID-only User Tower、Past positives、确定性 sampled
+negatives、weighted sampled-softmax、FAISS 参数、seen-item 过滤和 Future-A
+评估 cohort，唯一变化是 Item Tower 是否加入配置启用的商品内容。该实验没有
+User History、in-batch negative、temperature 或 hard negative。
+
+```bash
+# 1,000~10,000-row/1-epoch configuration overlay from config.yaml
+PYTHONPATH=src python src/pipeline/run_temporal_experiment.py --config config.yaml --stage content_item_two_tower_sanity
+
+# Formal Future-A development ablation; Future-B is not read
+PYTHONPATH=src python src/pipeline/run_temporal_experiment.py --config config.yaml --stage content_item_two_tower
+```
+
+候选仍使用 `user_id,candidate_ad_id,two_tower_score,rank`，统一指标写入
+`outputs/temporal/metrics/content_item_ablation.csv` 和 `.json`。`catalog_coverage`
+严格定义为召回到的唯一商品数除以 searchable catalogue 商品数。
+`product_catalog_path: null` 表示 Past-only catalogue，此时不会报告 cold recall；
+只有声明了不晚于 Past cutoff 的 point-in-time external catalogue，Past 未交互但
+可搜索的商品才会以 product-ID OOV 加正常 side information 的方式参与 cold recall。
+旧 `content_two_tower.py` 的 whole-Past history 实现只为历史兼容保留，不再由
+temporal pipeline 调用。
+
 ## Fine Ranking
 
 精排使用 PyTorch DCNv2 的共享 Cross/Deep backbone，并输出 click-conditioned

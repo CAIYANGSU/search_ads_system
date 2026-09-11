@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -70,7 +72,13 @@ def build_faiss_index(
     return index
 
 
-def save_faiss_index(index: faiss.Index, product_ids: np.ndarray, path: Path) -> None:
+def save_faiss_index(
+    index: faiss.Index,
+    product_ids: np.ndarray,
+    path: Path,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
     """Persist an index and its position-to-original-product-ID mapping."""
 
     _require_faiss()
@@ -82,9 +90,13 @@ def save_faiss_index(index: faiss.Index, product_ids: np.ndarray, path: Path) ->
     faiss.write_index(index, str(temporary_path))
     temporary_path.replace(path)
     metadata_path = path.with_name(path.name + ".metadata.json")
-    metadata_path.write_text(
-        json.dumps({"product_ids": identifiers.tolist()}, ensure_ascii=False), encoding="utf-8"
-    )
+    payload = {"product_ids": identifiers.tolist()}
+    if metadata is not None:
+        reserved = set(payload).intersection(metadata)
+        if reserved:
+            raise ValueError(f"FAISS metadata cannot override reserved keys: {sorted(reserved)}")
+        payload.update(dict(metadata))
+    metadata_path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
 def load_faiss_index(path: Path) -> tuple[faiss.Index, np.ndarray]:
@@ -98,6 +110,16 @@ def load_faiss_index(path: Path) -> tuple[faiss.Index, np.ndarray]:
     if index.ntotal != len(product_ids):
         raise ValueError("FAISS index and product ID metadata have different sizes")
     return index, product_ids
+
+
+def load_faiss_index_metadata(path: Path) -> dict[str, Any]:
+    """Read persisted index metadata without loading the FAISS index itself."""
+
+    metadata_path = path.with_name(path.name + ".metadata.json")
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("FAISS index metadata must be a JSON object")
+    return payload
 
 
 def search_faiss_index(index: faiss.Index, query_embeddings: np.ndarray, top_k: int) -> tuple[np.ndarray, np.ndarray]:

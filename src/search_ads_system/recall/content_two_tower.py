@@ -1,14 +1,16 @@
-"""Past-only, content-aware Two-Tower retrieval for temporal cold start.
+"""Legacy content-plus-history Two-Tower implementation.
 
-An optional product catalogue is a point-in-time input, not a Future-A/B
-label source.  Without one, the catalogue is built from Past and the run
-explicitly reports that it cannot index products absent from Past.
+This module is retained only so historical checkpoints/tests remain readable.
+It is not called by the strict-temporal pipeline because its fixed whole-Past
+history representation is not sample-time safe.  New experiments use
+``content_item_two_tower`` and an ID-only user tower.
 """
 from __future__ import annotations
 
 import csv
 import hashlib
 import json
+import logging
 import random
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ from torch.utils.data import DataLoader, Dataset
 from search_ads_system.recall.faiss_index import build_faiss_index, load_faiss_index, save_faiss_index, search_faiss_index
 from search_ads_system.recall.two_tower_recall import OUTPUT_COLUMNS, _input_csv_files, _select_device
 
+LOGGER = logging.getLogger(__name__)
 CONTENT_SCHEMA_VERSION = "content_two_tower_v1"
 CONTENT_COLUMNS = ("product_brand", "product_category_1", "product_category_2", "product_category_3", "product_gender", "product_age_group", "product_country")
 MISSING_TOKEN = "__UNKNOWN__"
@@ -226,6 +229,10 @@ def load_content_checkpoint(config: ContentTwoTowerConfig, device: torch.device)
 
 
 def run_content_two_tower_recall(config: ContentTwoTowerConfig) -> dict[str, Any]:
+    LOGGER.warning(
+        "Deprecated Content+History implementation invoked directly; "
+        "strict-temporal experiments use content_item_two_tower instead."
+    )
     _set_seed(config.seed); device = _select_device(config.device)
     if config.train or not config.checkpoint_path.is_file():
         data = prepare_content_training_data(config); dataset = ContentNegativeSamplingDataset(data, config)
