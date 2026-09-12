@@ -184,7 +184,7 @@ simple_two_tower_v2:
   embedding_dim: 64
   feature_embedding_dim: 16
   hidden_dims: [256, 128]
-  batch_size: 16384
+  batch_size: 32768
   epochs: 3
   learning_rate: 0.001
   weight_decay: 0.00001
@@ -513,7 +513,7 @@ temporal:
       max_train_rows: 200000
       epochs: 1
       batch_size: 4096
-      inference_batch_size: 16384
+      inference_batch_size: 32768
       num_workers: 4
       persistent_workers: true
       train: true
