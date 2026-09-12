@@ -175,6 +175,36 @@ training:
   num_workers: 4
   device: auto
 
+# Independent strict-temporal Two-Tower recall ablation.  It reads only
+# outputs/temporal/split/past and future_a, never Future-B.
+simple_two_tower_v2:
+  output_dir: outputs/temporal
+  max_users: 100000
+  seed: 42
+  embedding_dim: 64
+  feature_embedding_dim: 16
+  hidden_dims: [256, 128]
+  batch_size: 16384
+  epochs: 3
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  negative_samples: 5
+  click_weight: 1.0
+  conversion_weight: 3.0
+  temperature: 0.07
+  use_bf16: true
+  use_torch_compile: false
+  use_fused_adamw: true
+  top_k: 200
+  exclude_seen_items: true
+  retrieval_oversample_ratio: 2.0
+  retrieval_batch_size: 20000
+  inference_batch_size: 32768
+  variants: [v0_id_only, v1_item_content, v2_user_context_stats, v3_in_batch_negatives]
+  smoke_max_train_rows: 5000
+  tuning_max_train_rows: 65536
+  tuning_max_users: 5000
+
 recall:
   model: itemcf
   # Formal advertising funnel: each route supplies a Top1000 inventory, then
