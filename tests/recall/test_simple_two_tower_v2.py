@@ -9,7 +9,7 @@ import torch
 
 from search_ads_system.recall.simple_two_tower_v2 import (
     OOV_INDEX, SimpleTwoTowerV2Config, SimpleTwoTowerV2Model, _encode,
-    _hard_negative_fingerprint, _mine_hard_negative_pools, _source_fingerprint, _synchronize_cuda, _v2_teacher_fingerprint, _vocab,
+    _hard_negative_fingerprint, _mine_hard_negative_pools, _source_fingerprint, _synchronize_cuda, _torch_exact_topk, _v2_teacher_fingerprint, _vocab,
     assert_past_only_hard_negative_contract, duplicate_aware_inbatch_loss, evaluate_candidates, prepare_data, run_ablation, sample_mixed_negatives,
 )
 
@@ -167,7 +167,7 @@ def test_v4_mining_is_past_only_deterministic_and_excludes_known_positives(tmp_p
     pytest.importorskip("faiss")
     data, cfg = _v4_data(tmp_path)
     torch.manual_seed(cfg.seed); first_model = SimpleTwoTowerV2Model(data, cfg, "v2_user_context_stats")
-    first, _ = _mine_hard_negative_pools(first_model, data, cfg, torch.device("cpu"))
+    first, diagnostics = _mine_hard_negative_pools(first_model, data, cfg, torch.device("cpu"))
     # Truth is intentionally changed to impossible Future-A labels. Mining has
     # no truth argument and must return the same Past-only candidate pools.
     data.truth = {"u1": {"future_only"}}; data.warm_truth = {"u1": set()}
@@ -175,6 +175,24 @@ def test_v4_mining_is_past_only_deterministic_and_excludes_known_positives(tmp_p
     second, _ = _mine_hard_negative_pools(second_model, data, cfg, torch.device("cpu"))
     assert [x.tolist() for x in first] == [x.tolist() for x in second]
     assert_past_only_hard_negative_contract(data, data.train_user, data.train_item, first)
+    assert diagnostics["hard_negative_backend"] == "cpu_faiss"
+    assert len(first) == len(data.train_user)
+    torch.manual_seed(cfg.seed)
+    ranked_model = SimpleTwoTowerV2Model(data, cfg, "v2_user_context_stats")
+    ranked, _ = _mine_hard_negative_pools(ranked_model, data, replace(cfg, hard_negative_rank_start=1), torch.device("cpu"))
+    assert [pool.tolist() for pool in ranked] == [pool[1:].tolist() for pool in first]
+
+
+def test_torch_exact_topk_matches_cpu_faiss_without_ties():
+    """The CUDA fallback's math is exact FlatIP, independent of FAISS GPU."""
+    faiss = pytest.importorskip("faiss")
+    if hasattr(faiss, "omp_set_num_threads"): faiss.omp_set_num_threads(1)
+    items = torch.tensor([[1.0, 0.0], [0.0, 1.0], [.8, .6], [-1.0, 0.0]], dtype=torch.float32)
+    queries = torch.tensor([[.99, .01], [.1, .9]], dtype=torch.float32)
+    index = faiss.IndexFlatIP(2); index.add(items.numpy())
+    _, expected = index.search(queries.numpy(), 3)
+    actual = _torch_exact_topk(queries, items, count=3, batch_size=1, device=torch.device("cpu"))
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_v4_mixed_sampler_composition_and_random_fallback(tmp_path):

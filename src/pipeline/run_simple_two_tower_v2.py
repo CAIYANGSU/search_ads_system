@@ -15,7 +15,8 @@ def main() -> None:
     output = resolve_path(str(opt.get("output_dir", "outputs/temporal")), root); base = resolve_path(str(temporal.get("output_dir", "outputs/temporal")), root) / "split"
     if not (base / "past").exists() or not (base / "future_a").exists(): raise FileNotFoundError("Build the repository's strict temporal split and Future-A split first (outputs/temporal/split/past and future_a).")
     if args.stage == "smoke": opt.update({"max_users": min(int(opt.get("max_users", 100000)), 1000), "max_train_rows": int(opt.get("smoke_max_train_rows", 5000)), "epochs": 1, "top_k": 50, "batch_size": min(int(opt.get("batch_size", 16384)), 2048)})
-    if args.stage == "mining": opt.update({"max_users": min(int(opt.get("max_users", 100000)), 1000), "max_train_rows": int(opt.get("smoke_max_train_rows", 5000))})
+    # Mining intentionally keeps the configured full cohort.  Use
+    # --max-users/--max-train-rows for a bounded diagnostic run.
     if args.max_users is not None: opt["max_users"] = args.max_users
     if args.max_train_rows is not None: opt["max_train_rows"] = args.max_train_rows
     if args.variants: opt["variants"] = tuple(name for value in args.variants for name in value.split(",") if name)

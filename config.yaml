@@ -196,6 +196,11 @@ simple_two_tower_v2:
   hard_negative_retrieval_topn: 200
   hard_negative_rank_start: 10
   hard_negative_strategy: top_band
+  # Exact-retrieval engineering controls; these do not alter V4 candidates.
+  hard_negative_backend: auto
+  hard_negative_search_batch_size: 4096
+  hard_negative_cpu_threads: 0
+  hard_negative_progress_every: 5000
   click_weight: 1.0
   conversion_weight: 3.0
   temperature: 0.07

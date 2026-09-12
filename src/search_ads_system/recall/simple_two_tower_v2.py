@@ -12,6 +12,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass
@@ -52,6 +53,12 @@ class SimpleTwoTowerV2Config:
     hard_negative_retrieval_topn: int = 200
     hard_negative_rank_start: int = 10
     hard_negative_strategy: str = "top_band"
+    # Engineering-only V4 controls.  They do not affect the requested rank
+    # band or candidate definition, and so deliberately are not cache inputs.
+    hard_negative_backend: str = "auto"
+    hard_negative_search_batch_size: int = 4_096
+    hard_negative_cpu_threads: int = 0
+    hard_negative_progress_every: int = 5_000
     click_weight: float = 1.0
     conversion_weight: float = 3.0
     temperature: float = 0.07
@@ -523,6 +530,81 @@ def _build_index(embeddings: np.ndarray) -> Any:
         return NumpyIP(embeddings)
 
 
+def _gpu_faiss_available(device: torch.device) -> bool:
+    """Whether this runtime has usable FAISS GPU bindings, not just faiss."""
+    if device.type != "cuda" or not torch.cuda.is_available(): return False
+    try:
+        import faiss
+        return bool(hasattr(faiss, "StandardGpuResources") and hasattr(faiss, "index_cpu_to_gpu") and faiss.get_num_gpus() > 0)
+    except (ImportError, AttributeError, RuntimeError):
+        return False
+
+
+def _hard_negative_backend(config: SimpleTwoTowerV2Config, device: torch.device) -> str:
+    requested = config.hard_negative_backend.lower()
+    if requested not in {"auto", "gpu_faiss", "torch_cuda", "cpu_faiss"}:
+        raise ValueError(f"Unsupported hard-negative backend: {config.hard_negative_backend}")
+    cuda = device.type == "cuda" and torch.cuda.is_available()
+    if requested == "auto":
+        if _gpu_faiss_available(device): return "gpu_faiss"
+        if cuda: return "torch_cuda"
+        return "cpu_faiss"
+    if requested == "gpu_faiss" and not _gpu_faiss_available(device):
+        raise RuntimeError("hard_negative_backend=gpu_faiss requested, but FAISS GPU APIs are unavailable")
+    if requested == "torch_cuda" and not cuda:
+        raise RuntimeError("hard_negative_backend=torch_cuda requested, but CUDA is unavailable")
+    return requested
+
+
+def _cpu_faiss_threads(config: SimpleTwoTowerV2Config) -> int:
+    """Use server cores, except for the known unstable macOS FAISS runtime."""
+    if config.hard_negative_cpu_threads > 0: return config.hard_negative_cpu_threads
+    # The local macOS wheel can abort during search with its OpenMP pool.  This
+    # guard is intentionally platform-local; Linux benchmark hosts use all CPUs.
+    return 1 if sys.platform == "darwin" else (os.cpu_count() or 1)
+
+
+def _encode_mining_items(model: SimpleTwoTowerV2Model, count: int, batch_size: int, device: torch.device) -> Tensor:
+    """Encode the catalogue once, retaining its vectors on the chosen device."""
+    chunks = []
+    for start in range(0, count, batch_size):
+        positions = torch.arange(start, min(start + batch_size, count), device=device)
+        chunks.append(model.encode_items(positions))
+    return torch.cat(chunks).contiguous()
+
+
+def _encode_mining_contexts(model: SimpleTwoTowerV2Model, groups: np.ndarray, batch_size: int, device: torch.device) -> Tensor:
+    """Encode every exact (user, encoded-context) key once."""
+    chunks = []
+    for start in range(0, len(groups), batch_size):
+        piece = groups[start:start + batch_size]
+        positions = _device_array(piece[:, 0], device)
+        context = _device_array(piece[:, 1:], device)
+        chunks.append(model.encode_users(positions, context))
+    return torch.cat(chunks).contiguous()
+
+
+def _torch_exact_topk(queries: Tensor, item_vectors: Tensor, count: int, batch_size: int, device: torch.device, progress: Any = None) -> np.ndarray:
+    """Exact CUDA FlatIP equivalent without a full contexts-by-catalogue matrix."""
+    batches: list[np.ndarray] = []
+    start = 0
+    active_batch = max(1, batch_size)
+    while start < len(queries):
+        stop = min(start + active_batch, len(queries))
+        try:
+            # Keep full precision: reduced score precision can change close ranks.
+            _, indices = torch.topk(queries[start:stop] @ item_vectors.T, k=count, dim=1)
+            batches.append(indices.cpu().numpy().astype(np.int64, copy=False))
+            start = stop
+            if progress is not None: progress(start)
+        except torch.cuda.OutOfMemoryError:
+            if active_batch == 1: raise
+            torch.cuda.empty_cache(); active_batch = max(1, active_batch // 2)
+            _log(f"[hard-negative] CUDA OOM; reducing search batch size to {active_batch}")
+    _synchronize_cuda(device)
+    return np.concatenate(batches, axis=0)
+
+
 def _array_fingerprint(*arrays: np.ndarray) -> str:
     digest = hashlib.sha256()
     for value in arrays:
@@ -564,11 +646,14 @@ def _load_or_train_v2_teacher(data: PreparedData, config: SimpleTwoTowerV2Config
         except TypeError:  # torch < 2.0
             state = torch.load(checkpoint, map_location="cpu")
         model.load_state_dict(state); model.to(device)
-        return model, {"teacher_cache_hit": True, "teacher_cache_load_seconds": time.perf_counter() - started, "teacher_checkpoint": str(checkpoint), "teacher_checkpoint_sha256": _checkpoint_digest(checkpoint)}
+        elapsed = time.perf_counter() - started
+        _log(f"[hard-negative] V2 teacher cache load: {elapsed:.2f}s")
+        return model, {"teacher_cache_hit": True, "teacher_cache_load_seconds": elapsed, "teacher_checkpoint": str(checkpoint), "teacher_checkpoint_sha256": _checkpoint_digest(checkpoint)}
     train = train_model(model, data, config, device)
     model.to("cpu")
     torch.save(model.state_dict(), checkpoint)
     model.to(device)
+    _log(f"[hard-negative] V2 teacher train: {train['training_wall_seconds']:.2f}s")
     return model, {"teacher_cache_hit": False, "teacher_training_wall_seconds": train["training_wall_seconds"], "teacher_checkpoint": str(checkpoint), "teacher_checkpoint_sha256": _checkpoint_digest(checkpoint)}
 
 
@@ -600,44 +685,84 @@ def assert_past_only_hard_negative_contract(data: PreparedData, users: np.ndarra
 
 
 @torch.no_grad()
-def _mine_hard_negative_pools(model: SimpleTwoTowerV2Model, data: PreparedData, config: SimpleTwoTowerV2Config, device: torch.device) -> tuple[list[np.ndarray], dict[str, float]]:
+def _mine_hard_negative_pools(model: SimpleTwoTowerV2Model, data: PreparedData, config: SimpleTwoTowerV2Config, device: torch.device) -> tuple[list[np.ndarray], dict[str, Any]]:
     if config.hard_negative_strategy != "top_band": raise ValueError(f"Unsupported hard-negative strategy: {config.hard_negative_strategy}")
     if config.hard_negative_retrieval_topn < 1 or config.hard_negative_rank_start < 0: raise ValueError("Hard-negative retrieval parameters must be non-negative and non-empty")
+    if config.hard_negative_search_batch_size < 1: raise ValueError("hard_negative_search_batch_size must be positive")
     # Context participates in the key. We only reuse a retrieval pool when V2
     # would produce the identical user representation for that training row.
     keys = np.column_stack((data.train_user, data.train_context)).astype(np.int64, copy=False)
     groups, inverse = np.unique(keys, axis=0, return_inverse=True)
-    try:
-        import faiss
-    except ImportError as exc:
-        # Unlike the evaluator's small local fallback, V4 must never degrade
-        # into a user-by-catalogue dense score matrix during mining.
-        raise RuntimeError("v4_hard_negatives requires faiss-cpu/faiss-gpu; install the repository requirements before mining") from exc
-    if hasattr(faiss, "omp_set_num_threads"): faiss.omp_set_num_threads(1)
-    model.eval(); item_vectors = _embeddings(model, len(data.products), config.inference_batch_size, device, users=False)
-    item_vectors = np.ascontiguousarray(item_vectors, dtype=np.float32)
-    index = faiss.IndexFlatIP(item_vectors.shape[1]); index.add(item_vectors)
+    backend = _hard_negative_backend(config, device)
+    _log(f"[hard-negative] backend={backend}" + (f" threads={_cpu_faiss_threads(config)}" if backend == "cpu_faiss" else ""))
+    model.eval(); total_started = time.perf_counter()
+    if device.type == "cuda": torch.cuda.reset_peak_memory_stats(device)
+    _synchronize_cuda(device); embedding_started = time.perf_counter()
+    item_vectors = _encode_mining_items(model, len(data.products), config.inference_batch_size, device)
+    context_vectors = _encode_mining_contexts(model, groups, config.inference_batch_size, device)
+    _synchronize_cuda(device); embedding_seconds = time.perf_counter() - embedding_started
     requested = min(len(data.products), config.hard_negative_retrieval_topn)
+    setup_started = time.perf_counter()
+    index: Any | None = None
+    if backend in {"gpu_faiss", "cpu_faiss"}:
+        try:
+            import faiss
+        except ImportError as exc:
+            raise RuntimeError("v4_hard_negatives requires faiss-cpu/faiss-gpu for this backend") from exc
+        item_cpu = np.ascontiguousarray(item_vectors.float().cpu().numpy(), dtype=np.float32)
+        cpu_index = faiss.IndexFlatIP(item_cpu.shape[1]); cpu_index.add(item_cpu)
+        if backend == "gpu_faiss":
+            # Retain resources for the lifetime of the GPU index.  FlatIP is
+            # exact and item vectors are uploaded exactly once.
+            try:
+                resources = faiss.StandardGpuResources()
+                index = faiss.index_cpu_to_gpu(resources, device.index or 0, cpu_index)
+            except RuntimeError:
+                if config.hard_negative_backend.lower() != "auto": raise
+                backend, index = "torch_cuda", None
+                _log("[hard-negative] GPU FAISS initialization failed; backend=torch_cuda")
+        else:
+            threads = _cpu_faiss_threads(config)
+            if hasattr(faiss, "omp_set_num_threads"): faiss.omp_set_num_threads(max(1, threads))
+            index = cpu_index
+    _synchronize_cuda(device); setup_seconds = time.perf_counter() - setup_started
+    _synchronize_cuda(device); search_started = time.perf_counter()
+    last_progress = 0
+    def search_progress(done: int) -> None:
+        nonlocal last_progress
+        if done == len(groups) or done - last_progress >= max(1, config.hard_negative_progress_every):
+            elapsed = time.perf_counter() - total_started
+            _log(f"[hard-negative] contexts {done:,} / {len(groups):,} ({100 * done / max(len(groups), 1):.1f}%), {done / max(elapsed, 1e-9):,.0f} ctx/s, elapsed={elapsed:.1f}s")
+            last_progress = done
+    if backend == "torch_cuda":
+        retrieved_positions = _torch_exact_topk(context_vectors, item_vectors, requested, config.hard_negative_search_batch_size, device, search_progress)
+    else:
+        # GPU FAISS's Python interface consumes contiguous NumPy query batches;
+        # the FlatIP index itself and its catalogue remain resident on GPU.
+        query_cpu = np.ascontiguousarray(context_vectors.float().cpu().numpy(), dtype=np.float32)
+        result: list[np.ndarray] = []
+        for start in range(0, len(query_cpu), config.hard_negative_search_batch_size):
+            _, positions = _search(index, query_cpu[start:start + config.hard_negative_search_batch_size], requested)
+            result.append(positions.astype(np.int64, copy=False))
+            search_progress(min(start + config.hard_negative_search_batch_size, len(query_cpu)))
+        retrieved_positions = np.concatenate(result, axis=0) if result else np.empty((0, requested), dtype=np.int64)
+    _synchronize_cuda(device); raw_search_seconds = time.perf_counter() - search_started
     group_pools: list[np.ndarray] = []; group_ranks: list[np.ndarray] = []
     rejected = 0
-    for start in range(0, len(groups), config.retrieval_batch_size):
-        batch = groups[start:start + config.retrieval_batch_size]
-        vectors: list[np.ndarray] = []
-        for offset in range(0, len(batch), config.inference_batch_size):
-            piece = batch[offset:offset + config.inference_batch_size]
-            positions = torch.as_tensor(piece[:, 0], device=device)
-            context = torch.as_tensor(piece[:, 1:], device=device)
-            vectors.append(model.encode_users(positions, context).float().cpu().numpy())
-        _, positions = _search(index, np.concatenate(vectors).astype(np.float32, copy=False), requested)
-        for key, retrieved in zip(batch, positions, strict=True):
-            history = data.histories[int(key[0])]
-            allowed = [int(item) for item in retrieved if int(item) not in history]
-            rejected += len(retrieved) - len(allowed)
-            # rank_start is applied after known-positive removal, so the
-            # highest unlabelled-looking candidates can be conservatively skipped.
-            selected = np.asarray(allowed[config.hard_negative_rank_start:], dtype=np.int64)
-            original_ranks = np.asarray([rank + 1 for rank, item in enumerate(retrieved) if int(item) not in history][config.hard_negative_rank_start:], dtype=np.int64)
-            group_pools.append(selected); group_ranks.append(original_ranks)
+    filtering_started = time.perf_counter(); progress_at = max(1, config.hard_negative_progress_every)
+    for row, (key, retrieved) in enumerate(zip(groups, retrieved_positions, strict=True), start=1):
+        history = data.histories[int(key[0])]
+        allowed = [int(item) for item in retrieved if int(item) not in history]
+        rejected += len(retrieved) - len(allowed)
+        # rank_start is applied after known-positive removal, so the highest
+        # unlabelled-looking candidates are still conservatively skipped.
+        group_pools.append(np.asarray(allowed[config.hard_negative_rank_start:], dtype=np.int64))
+        group_ranks.append(np.asarray([rank + 1 for rank, item in enumerate(retrieved) if int(item) not in history][config.hard_negative_rank_start:], dtype=np.int64))
+        if row == len(groups) or row % progress_at == 0:
+            elapsed = time.perf_counter() - total_started
+            _log(f"[hard-negative] contexts {row:,} / {len(groups):,} ({100 * row / max(len(groups), 1):.1f}%), {row / max(elapsed, 1e-9):,.0f} ctx/s, elapsed={elapsed:.1f}s")
+    filtering_seconds = time.perf_counter() - filtering_started
+    pool_started = time.perf_counter()
     pools = [group_pools[int(group)] for group in inverse]
     ranks = [group_ranks[int(group)] for group in inverse]
     assert_past_only_hard_negative_contract(data, data.train_user, data.train_item, pools)
@@ -646,15 +771,26 @@ def _mine_hard_negative_pools(model: SimpleTwoTowerV2Model, data: PreparedData, 
     pool_values = np.concatenate([pool for pool in pools if len(pool)]) if any(len(pool) for pool in pools) else np.empty(0, dtype=np.int64)
     counts = np.bincount(data.train_item, minlength=len(data.products)); order = np.argsort(counts)
     buckets = {"tail": set(order[:int(.5 * len(order))]), "mid": set(order[int(.5 * len(order)):int(.8 * len(order))]), "head": set(order[int(.8 * len(order)):])}
-    diagnostics: dict[str, float] = {
+    diagnostics: dict[str, Any] = {
+        "hard_negative_backend": backend,
         "hard_negative_unique_user_contexts": float(len(groups)), "hard_negative_average_available_per_user_context": float(available.mean()) if len(available) else 0.0,
         "hard_negative_fraction_examples_requested_available": float(np.mean(available >= config.hard_negative_count)) if len(available) else 0.0,
         "hard_negative_known_positive_rejections": float(rejected), "hard_negative_known_positive_rejection_rate": rejected / max(len(groups) * requested, 1),
         "hard_negative_average_v2_rank": float(all_ranks.mean()) if len(all_ranks) else float("nan"), "hard_negative_p50_v2_rank": float(np.percentile(all_ranks, 50)) if len(all_ranks) else float("nan"),
         "hard_negative_p95_v2_rank": float(np.percentile(all_ranks, 95)) if len(all_ranks) else float("nan"), "hard_negative_unique_items": float(len(np.unique(pool_values))),
         "hard_negative_pool_duplicate_rate": 0.0,
+        "hard_negative_embedding_seconds": embedding_seconds,
+        "hard_negative_index_setup_seconds": setup_seconds,
+        "hard_negative_raw_search_seconds": raw_search_seconds,
+        "hard_negative_positive_filtering_seconds": filtering_seconds,
+        "hard_negative_pool_construction_seconds": time.perf_counter() - pool_started,
+        "hard_negative_search_batch_size": float(config.hard_negative_search_batch_size),
+        "hard_negative_catalogue_size": float(len(data.products)),
+        "hard_negative_embedding_dimension": float(item_vectors.shape[1]),
+        "hard_negative_contexts_per_second": len(groups) / max(time.perf_counter() - total_started, 1e-9),
     }
     for name, values in buckets.items(): diagnostics[f"hard_negative_{name}_fraction"] = sum(int(item) in values for item in pool_values) / max(len(pool_values), 1)
+    if device.type == "cuda": diagnostics["hard_negative_peak_gpu_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
     return pools, diagnostics
 
 
@@ -672,19 +808,39 @@ def _load_or_mine_hard_negatives(model: SimpleTwoTowerV2Model, data: PreparedDat
                 groups = [items[offsets[i]:offsets[i + 1]] for i in range(len(keys))]
                 pools = [groups[int(index)] for index in inverse]
                 assert_past_only_hard_negative_contract(data, data.train_user, data.train_item, pools)
+                _log("[hard-negative] cache hit; skipping mining")
                 return pools, {**metadata["diagnostics"], "hard_negative_cache_hit": True, "hard_negative_cache_load_seconds": time.perf_counter() - started, "hard_negative_mining_wall_seconds": 0.0, "hard_negative_cache_path": str(arrays_path), "hard_negative_fingerprint": fingerprint}
         _log("[hard-negatives] cache metadata did not match; re-mining.")
     started = time.perf_counter(); pools, diagnostics = _mine_hard_negative_pools(model, data, config, device)
     # Store one pool per exact (user, encoded-context) key rather than one per
     # interaction. This preserves V2 semantics and is much smaller on repeat users.
+    serialization_started = time.perf_counter()
     keys = np.column_stack((data.train_user, data.train_context)).astype(np.int64, copy=False)
     groups, inverse = np.unique(keys, axis=0, return_inverse=True)
-    group_pools = [pools[int(np.flatnonzero(inverse == index)[0])] for index in range(len(groups))]
+    # ``inverse`` maps each training row to its group.  Selecting its first
+    # occurrence vectorially avoids one full training-row scan per group.
+    _, representative_rows = np.unique(inverse, return_index=True)
+    group_pools = [pools[int(row)] for row in representative_rows]
     offsets = [0]; flat: list[int] = []
     for pool in group_pools: flat.extend(pool.tolist()); offsets.append(len(flat))
     np.savez_compressed(arrays_path, user_context_keys=groups, training_group_index=inverse.astype(np.int64), candidate_offsets=np.asarray(offsets, dtype=np.int64), candidate_item_indices=np.asarray(flat, dtype=np.int64))
+    diagnostics["hard_negative_cache_serialization_seconds"] = time.perf_counter() - serialization_started
     diagnostics = {**diagnostics, "hard_negative_cache_hit": False, "hard_negative_cache_load_seconds": 0.0, "hard_negative_mining_wall_seconds": time.perf_counter() - started, "hard_negative_cache_path": str(arrays_path), "hard_negative_fingerprint": fingerprint}
     metadata_path.write_text(json.dumps({"fingerprint": fingerprint, "teacher_checkpoint_sha256": teacher["teacher_checkpoint_sha256"], "diagnostics": diagnostics}, indent=2, default=str), encoding="utf-8")
+    _log("[hard-negative] complete " + ", ".join((
+        f"backend={diagnostics['hard_negative_backend']}",
+        f"contexts={int(diagnostics['hard_negative_unique_user_contexts']):,}",
+        f"catalogue={int(diagnostics['hard_negative_catalogue_size']):,}",
+        f"dim={int(diagnostics['hard_negative_embedding_dimension'])}",
+        f"search_batch={int(diagnostics['hard_negative_search_batch_size'])}",
+        f"embeddings={diagnostics['hard_negative_embedding_seconds']:.2f}s",
+        f"setup={diagnostics['hard_negative_index_setup_seconds']:.2f}s",
+        f"search={diagnostics['hard_negative_raw_search_seconds']:.2f}s",
+        f"filter={diagnostics['hard_negative_positive_filtering_seconds']:.2f}s",
+        f"cache={diagnostics['hard_negative_cache_serialization_seconds']:.2f}s",
+        f"total={diagnostics['hard_negative_mining_wall_seconds']:.2f}s",
+        f"ctx/s={diagnostics['hard_negative_contexts_per_second']:.0f}",
+    )))
     return pools, diagnostics
 
 
