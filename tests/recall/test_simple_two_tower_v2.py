@@ -8,7 +8,7 @@ import torch
 
 from search_ads_system.recall.simple_two_tower_v2 import (
     OOV_INDEX, SimpleTwoTowerV2Config, SimpleTwoTowerV2Model, _encode,
-    _synchronize_cuda, _vocab, duplicate_aware_inbatch_loss, evaluate_candidates, prepare_data, run_ablation,
+    _source_fingerprint, _synchronize_cuda, _vocab, duplicate_aware_inbatch_loss, evaluate_candidates, prepare_data, run_ablation,
 )
 
 
@@ -108,6 +108,22 @@ def test_future_a_never_expands_past_vocabs_and_cohort_is_deterministic(tmp_path
     assert "future_brand" not in first.vocabs["product_brand"]
     assert "future_device" not in first.vocabs["device_type"]
     assert first.users.tolist() == second.users.tolist()
+
+
+def test_preprocessing_cache_preserves_prepared_state_and_reports_stages(tmp_path):
+    _window(tmp_path / "past", _rows(10)); _window(tmp_path / "future_a", _rows(30))
+    config = _config(tmp_path)
+    cold, warm = prepare_data(config), prepare_data(config)
+    assert (config.output_dir / "simple_two_tower_v2_cache" / "prepared_arrays.npz").is_file()
+    assert np.array_equal(cold.users, warm.users)
+    assert np.array_equal(cold.products, warm.products)
+    assert np.array_equal(cold.train_user, warm.train_user)
+    assert np.array_equal(cold.item_features, warm.item_features)
+    assert cold.truth == warm.truth and cold.histories == warm.histories
+    assert cold.metadata["preprocessing_stage_seconds"]
+    before = _source_fingerprint(config)
+    with (tmp_path / "past" / "part-00000.csv").open("a", encoding="utf-8") as handle: handle.write("\n")
+    assert _source_fingerprint(config) != before
 
 
 def test_end_to_end_cpu_smoke_all_four_variants(tmp_path):

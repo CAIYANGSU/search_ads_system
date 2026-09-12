@@ -195,6 +195,8 @@ simple_two_tower_v2:
   use_bf16: true
   use_torch_compile: false
   use_fused_adamw: true
+  use_preprocessing_cache: true
+  rebuild_preprocessing_cache: false
   top_k: 200
   exclude_seen_items: true
   retrieval_oversample_ratio: 2.0
