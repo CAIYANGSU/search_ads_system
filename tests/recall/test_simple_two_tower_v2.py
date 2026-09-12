@@ -8,7 +8,7 @@ import torch
 
 from search_ads_system.recall.simple_two_tower_v2 import (
     OOV_INDEX, SimpleTwoTowerV2Config, SimpleTwoTowerV2Model, _encode,
-    _vocab, duplicate_aware_inbatch_loss, evaluate_candidates, prepare_data, run_ablation,
+    _synchronize_cuda, _vocab, duplicate_aware_inbatch_loss, evaluate_candidates, prepare_data, run_ablation,
 )
 
 
@@ -61,14 +61,33 @@ def test_retrieval_metrics_have_correct_recall_hit_mrr_ndcg_and_ordering(tmp_pat
         ("u1", "a", .9, 1, "v"), ("u1", "x", .8, 2, "v"),
         ("u2", "x", .9, 1, "v"), ("u2", "b", .8, 2, "v"),
     ], columns=["user_id", "candidate_ad_id", "two_tower_score", "rank", "model_variant"]).to_csv(path, index=False)
-    result = evaluate_candidates(path, {"u1": {"a", "z"}, "u2": {"b"}}, {"u1": {"a"}, "u2": {"b"}}, {"a", "b", "x"})
+    result = evaluate_candidates(path, {"u1": {"a", "z"}, "u2": {"b"}}, {"u1": {"a"}, "u2": {"b"}}, {"a", "b", "x"}, top_k=50)
     assert result["overall_recall@50"] == pytest.approx(.75)
     assert result["hit_rate@50"] == 1
-    assert result["mrr@100"] == pytest.approx(.75)
-    assert 0 < result["ndcg@100"] <= 1
+    assert result["mrr@50"] == pytest.approx(.75)
+    assert 0 < result["ndcg@50"] <= 1
+    assert not any("@100" in key or "@200" in key for key in result)
     broken = pd.read_csv(path); broken.loc[1, "rank"] = 3; broken.to_csv(path, index=False)
     with pytest.raises(AssertionError, match="contiguous"):
-        evaluate_candidates(path, {"u1": {"a"}}, {"u1": {"a"}}, {"a"})
+        evaluate_candidates(path, {"u1": {"a"}}, {"u1": {"a"}}, {"a"}, top_k=50)
+
+
+def test_zero_hit_recall_is_zero_and_only_supported_cutoffs_are_reported(tmp_path):
+    path = tmp_path / "zero_hits.csv"
+    pd.DataFrame([("u1", "x", .9, 1, "v")], columns=["user_id", "candidate_ad_id", "two_tower_score", "rank", "model_variant"]).to_csv(path, index=False)
+    result = evaluate_candidates(path, {"u1": {"a"}}, {"u1": {"a"}}, {"a", "x"}, top_k=50)
+    assert result["overall_recall@50"] == 0.0
+    assert result["warm_recall@50"] == 0.0
+    assert "overall_recall@100" not in result and "warm_recall@200" not in result
+    full = evaluate_candidates(path, {"u1": {"a"}}, {"u1": {"a"}}, {"a", "x"}, top_k=200)
+    assert {"overall_recall@50", "overall_recall@100", "overall_recall@200"}.issubset(full)
+
+
+def test_cuda_synchronization_helper_only_syncs_cuda(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: calls.append(device.type))
+    _synchronize_cuda(torch.device("cpu")); _synchronize_cuda(torch.device("cuda"))
+    assert calls == ["cuda"]
 
 
 def test_variant_architectures_run_on_cpu(tmp_path):
@@ -102,10 +121,10 @@ def test_end_to_end_cpu_smoke_all_four_variants(tmp_path):
     for user, product in (("u1", "p0"), ("u1", "p4"), ("u1", "p8"), ("u2", "p1")):
         future.append({**_rows(40, (user,))[0], "user_id": user, "product_id": product, "click_timestamp": 40})
     _window(tmp_path / "past", past); _window(tmp_path / "future_a", future)
-    cfg = SimpleTwoTowerV2Config(tmp_path / "past", tmp_path / "future_a", tmp_path / "out", max_users=2, batch_size=4, epochs=1, top_k=2, hidden_dims=(8,), embedding_dim=4, feature_embedding_dim=3, device="cpu", use_bf16=False, variants=("v0_id_only", "v1_item_content", "v2_user_context_stats", "v3_in_batch_negatives"))
+    cfg = SimpleTwoTowerV2Config(tmp_path / "past", tmp_path / "future_a", tmp_path / "out", max_users=2, batch_size=4, epochs=1, top_k=50, hidden_dims=(8,), embedding_dim=4, feature_embedding_dim=3, device="cpu", use_bf16=False, variants=("v0_id_only", "v1_item_content", "v2_user_context_stats", "v3_in_batch_negatives"))
     result = run_ablation(cfg)
     assert result.model.tolist() == list(cfg.variants)
     assert (cfg.output_dir / "metrics" / "simple_two_tower_v2_ablation.csv").is_file()
     for variant in cfg.variants:
-        candidates = pd.read_csv(cfg.output_dir / "candidates" / f"{variant}_top2.csv")
-        assert candidates.groupby("user_id").size().le(2).all()
+        candidates = pd.read_csv(cfg.output_dir / "candidates" / f"{variant}_top50.csv")
+        assert candidates.groupby("user_id").size().le(50).all()

@@ -260,6 +260,11 @@ def _device_array(values: np.ndarray, device: torch.device) -> Tensor:
     return tensor.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else tensor.to(device)
 
 
+def _synchronize_cuda(device: torch.device) -> None:
+    """Put CUDA work on the correct side of a coarse wall-clock boundary."""
+    if device.type == "cuda": torch.cuda.synchronize(device)
+
+
 def _sample_past_negatives(users: np.ndarray, data: PreparedData, count: int, rng: np.random.Generator) -> np.ndarray:
     """Vectorized draws with bounded, set-based rejection of known Past pairs."""
     result = rng.integers(0, len(data.products), size=(len(users), count), dtype=np.int64)
@@ -281,6 +286,7 @@ def _sample_past_negatives(users: np.ndarray, data: PreparedData, count: int, rn
 def train_model(model: SimpleTwoTowerV2Model, data: PreparedData, config: SimpleTwoTowerV2Config, device: torch.device) -> dict[str, float]:
     rng = np.random.default_rng(config.seed); model.to(device); model.train(); optimizer = _optimizer(model, config)
     users, items, context, weights = data.train_user, data.train_item, data.train_context, data.train_weight
+    _synchronize_cuda(device)
     start, samples, batches, loss_sum = time.perf_counter(), 0, 0, 0.0
     bf16 = config.use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
     for _ in range(config.epochs):
@@ -299,6 +305,7 @@ def train_model(model: SimpleTwoTowerV2Model, data: PreparedData, config: Simple
                     loss = (F.cross_entropy(logits, torch.zeros(len(indices), dtype=torch.long, device=device), reduction="none") * w).sum() / w.sum().clamp_min(1)
             optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
             samples += len(indices); batches += 1; loss_sum += float(loss.detach())
+    _synchronize_cuda(device)
     elapsed = time.perf_counter() - start
     return {"training_wall_seconds": elapsed, "training_rows_per_second": samples / max(elapsed, 1e-9), "training_batches_per_second": batches / max(elapsed, 1e-9), "train_loss": loss_sum / max(batches, 1), "bf16_active": bf16}
 
@@ -331,7 +338,9 @@ def _build_index(embeddings: np.ndarray) -> Any:
 
 def write_candidates(model: SimpleTwoTowerV2Model, data: PreparedData, config: SimpleTwoTowerV2Config, device: torch.device, variant: str) -> dict[str, float]:
     output = config.output_dir / "candidates" / f"{variant}_top{config.top_k}.csv"; output.parent.mkdir(parents=True, exist_ok=True)
-    index_start = time.perf_counter(); item_vectors = _embeddings(model, len(data.products), config.inference_batch_size, device, users=False); index = _build_index(item_vectors); index_seconds = time.perf_counter() - index_start
+    _synchronize_cuda(device)
+    index_start = time.perf_counter(); item_vectors = _embeddings(model, len(data.products), config.inference_batch_size, device, users=False); _synchronize_cuda(device); index = _build_index(item_vectors); index_seconds = time.perf_counter() - index_start
+    _synchronize_cuda(device)
     retrieve_start, latencies, retained, short = time.perf_counter(), [], 0, 0
     requested = min(len(data.products), max(config.top_k, int(math.ceil(config.top_k * config.retrieval_oversample_ratio))))
     with output.open("w", newline="", encoding="utf-8") as handle:
@@ -347,21 +356,27 @@ def write_candidates(model: SimpleTwoTowerV2Model, data: PreparedData, config: S
                     if rank == config.top_k: break
                 retained += rank; short += int(rank < config.top_k)
             latencies.append(time.perf_counter() - t0)
+    _synchronize_cuda(device)
     elapsed = time.perf_counter() - retrieve_start
     return {"candidate_path": str(output), "index_build_seconds": index_seconds, "retrieval_wall_seconds": elapsed, "retrieval_users_per_second": len(data.users) / max(elapsed, 1e-9), "faiss_search_seconds_included": elapsed, "retrieval_batch_p50_seconds": float(np.percentile(latencies, 50)), "retrieval_batch_p95_seconds": float(np.percentile(latencies, 95)), "average_retained_candidates": retained / len(data.users), "users_below_top_k": short, "unique_catalogue_items": len(data.products)}
 
 
-def evaluate_candidates(path: Path, truth: Mapping[str, set[str]], warm_truth: Mapping[str, set[str]], catalogue: set[str]) -> dict[str, float]:
-    sums = defaultdict(float); ndcg = mrr = 0.0; recalled_at_100: set[str] = set(); seen_users: set[str] = set(); previous: str | None = None; last_rank = 0
+def evaluate_candidates(path: Path, truth: Mapping[str, set[str]], warm_truth: Mapping[str, set[str]], catalogue: set[str], *, top_k: int = 200) -> dict[str, float]:
+    """Evaluate only ranks that were actually retrieved; zero-hit recall is 0.0."""
+    cutoffs = tuple(cutoff for cutoff in CUT_OFFS if cutoff <= top_k)
+    if not cutoffs: raise ValueError(f"top_k must be at least {min(CUT_OFFS)} to report recall")
+    ranking_cutoff = min(100, top_k)
+    sums = {f"overall_recall@{cutoff}": 0.0 for cutoff in cutoffs} | {f"warm_recall@{cutoff}": 0.0 for cutoff in cutoffs}
+    ndcg = mrr = 0.0; recalled: set[str] = set(); seen_users: set[str] = set(); previous: str | None = None; last_rank = 0
     with path.open(encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             user, item, rank = row["user_id"], row["candidate_ad_id"], int(row["rank"])
             if user != previous: previous, last_rank = user, 0
             if rank != last_rank + 1: raise AssertionError("Candidate rows must be contiguous user groups with ranks starting at 1")
             last_rank = rank; seen_users.add(user)
-            if rank <= 100: recalled_at_100.add(item)
+            if rank <= ranking_cutoff: recalled.add(item)
             target, warm = truth.get(user, set()), warm_truth.get(user, set())
-            for cutoff in CUT_OFFS:
+            for cutoff in cutoffs:
                 if rank <= cutoff and item in target: sums[f"overall_recall@{cutoff}"] += 1 / len(target)
                 if rank <= cutoff and item in warm: sums[f"warm_recall@{cutoff}"] += 1 / len(warm)
     # Re-read grouped only for rank-sensitive MRR/NDCG, keeping the normal path streaming and bounded.
@@ -369,29 +384,29 @@ def evaluate_candidates(path: Path, truth: Mapping[str, set[str]], warm_truth: M
     for chunk in pd.read_csv(path, usecols=["user_id", "candidate_ad_id"], chunksize=200_000):
         for user, item in chunk.itertuples(index=False, name=None): per_user[str(user)].append(str(item))
     for user, target in truth.items():
-        candidates = per_user.get(user, [])[:100]; gains = [int(item in target) for item in candidates]
+        candidates = per_user.get(user, [])[:ranking_cutoff]; gains = [int(item in target) for item in candidates]
         first = next((i + 1 for i, gain in enumerate(gains) if gain), None)
         mrr += 0.0 if first is None else 1 / first
-        dcg = sum(gain / math.log2(i + 2) for i, gain in enumerate(gains)); ideal = sum(1 / math.log2(i + 2) for i in range(min(len(target), 100))); ndcg += dcg / ideal if ideal else 0.0
+        dcg = sum(gain / math.log2(i + 2) for i, gain in enumerate(gains)); ideal = sum(1 / math.log2(i + 2) for i in range(min(len(target), ranking_cutoff))); ndcg += dcg / ideal if ideal else 0.0
     users, warm_users = len(truth), sum(bool(values) for values in warm_truth.values())
-    result = {key: value / (warm_users if key.startswith("warm_") else users) for key, value in sums.items()}
-    result.update({f"hit_rate@{cutoff}": sum(1 for user, target in truth.items() if set(per_user.get(user, [])[:cutoff]) & target) / users for cutoff in CUT_OFFS})
-    result.update({"ndcg@100": ndcg / users, "mrr@100": mrr / users, "unique_recalled_items": len(recalled_at_100), "catalog_coverage@100": len(recalled_at_100) / max(len(catalogue), 1), "candidate_users": len(seen_users)})
+    result = {key: value / (warm_users if key.startswith("warm_") else users) if (warm_users if key.startswith("warm_") else users) else float("nan") for key, value in sums.items()}
+    result.update({f"hit_rate@{cutoff}": sum(1 for user, target in truth.items() if set(per_user.get(user, [])[:cutoff]) & target) / users if users else float("nan") for cutoff in cutoffs})
+    result.update({f"ndcg@{ranking_cutoff}": ndcg / users if users else float("nan"), f"mrr@{ranking_cutoff}": mrr / users if users else float("nan"), "unique_recalled_items": len(recalled), f"catalog_coverage@{ranking_cutoff}": len(recalled) / max(len(catalogue), 1), "candidate_users": len(seen_users)})
     return result
 
 
-def popularity_metrics(path: Path, truth: Mapping[str, set[str]], data: PreparedData) -> dict[str, float]:
+def popularity_metrics(path: Path, truth: Mapping[str, set[str]], data: PreparedData, *, top_k: int) -> dict[str, float]:
     counts = np.bincount(data.train_item, minlength=len(data.products)); order = np.argsort(counts); groups = {"head": set(order[int(.8 * len(order)):]), "mid": set(order[int(.5 * len(order)):int(.8 * len(order))]), "tail": set(order[:int(.5 * len(order))])}
     if any(not values for values in groups.values()): raise RuntimeError("Popularity buckets must be non-empty")
     products = data.products; candidates: dict[str, set[str]] = defaultdict(set)
     for chunk in pd.read_csv(path, usecols=["user_id", "candidate_ad_id", "rank"], chunksize=200_000):
         for user, item, rank in chunk.itertuples(index=False, name=None):
-            if int(rank) <= 100: candidates[str(user)].add(str(item))
+            if int(rank) <= top_k: candidates[str(user)].add(str(item))
     result = {}
     for name, positions in groups.items():
         valid = {products[i] for i in positions}; denominator = sum(len(values & valid) for values in truth.values())
         if not denominator: raise RuntimeError(f"Popularity bucket {name} has no Future-A truth")
-        numerator = sum(len(candidates[user] & values & valid) for user, values in truth.items()); result[f"{name}_recall@100"] = numerator / denominator
+        numerator = sum(len(candidates[user] & values & valid) for user, values in truth.items()); result[f"{name}_recall@{top_k}"] = numerator / denominator
     return result
 
 
@@ -408,8 +423,8 @@ def run_ablation(config: SimpleTwoTowerV2Config) -> pd.DataFrame:
         if config.use_torch_compile and hasattr(torch, "compile"):
             model = torch.compile(model)
         train = train_model(model, data, config, device); retrieval = write_candidates(model, data, config, device, variant)
-        metrics = evaluate_candidates(Path(retrieval["candidate_path"]), data.truth, data.warm_truth, set(data.products))
-        metrics.update(popularity_metrics(Path(retrieval["candidate_path"]), data.truth, data)); gpu = torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0.0
+        metrics = evaluate_candidates(Path(retrieval["candidate_path"]), data.truth, data.warm_truth, set(data.products), top_k=config.top_k)
+        metrics.update(popularity_metrics(Path(retrieval["candidate_path"]), data.truth, data, top_k=config.top_k)); gpu = torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0.0
         try:
             import psutil
             host_mb = psutil.Process(os.getpid()).memory_info().rss / 2**20
