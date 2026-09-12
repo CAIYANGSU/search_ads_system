@@ -8,19 +8,30 @@ from search_ads_system.common.config import load_yaml_config, resolve_path
 from search_ads_system.recall.simple_two_tower_v2 import SimpleTwoTowerV2Config, run_ablation
 
 def main() -> None:
-    parser = argparse.ArgumentParser(); parser.add_argument("--config", type=Path, default=ROOT / "config.yaml"); parser.add_argument("--stage", choices=("smoke", "preprocess", "benchmark", "tune"), default="smoke"); args = parser.parse_args()
+    parser = argparse.ArgumentParser(); parser.add_argument("--config", type=Path, default=ROOT / "config.yaml"); parser.add_argument("--stage", choices=("smoke", "preprocess", "mining", "benchmark", "tune"), default="smoke"); parser.add_argument("--variants", nargs="+", help="Variants to run, e.g. --variants v4_hard_negatives"); parser.add_argument("--max-users", type=int); parser.add_argument("--max-train-rows", type=int); args = parser.parse_args()
     raw = load_yaml_config(args.config); root = args.config.resolve().parent; opt = dict(raw.get("simple_two_tower_v2", {})); temporal = raw.get("temporal", {})
     if opt.get("cache_dir"):
         opt["cache_dir"] = resolve_path(str(opt["cache_dir"]), root)
     output = resolve_path(str(opt.get("output_dir", "outputs/temporal")), root); base = resolve_path(str(temporal.get("output_dir", "outputs/temporal")), root) / "split"
     if not (base / "past").exists() or not (base / "future_a").exists(): raise FileNotFoundError("Build the repository's strict temporal split and Future-A split first (outputs/temporal/split/past and future_a).")
     if args.stage == "smoke": opt.update({"max_users": min(int(opt.get("max_users", 100000)), 1000), "max_train_rows": int(opt.get("smoke_max_train_rows", 5000)), "epochs": 1, "top_k": 50, "batch_size": min(int(opt.get("batch_size", 16384)), 2048)})
+    if args.stage == "mining": opt.update({"max_users": min(int(opt.get("max_users", 100000)), 1000), "max_train_rows": int(opt.get("smoke_max_train_rows", 5000))})
+    if args.max_users is not None: opt["max_users"] = args.max_users
+    if args.max_train_rows is not None: opt["max_train_rows"] = args.max_train_rows
+    if args.variants: opt["variants"] = tuple(name for value in args.variants for name in value.split(",") if name)
     cfg = SimpleTwoTowerV2Config(past_path=base / "past", future_a_path=base / "future_a", output_dir=output / ("simple_two_tower_v2_smoke" if args.stage == "smoke" else "."), **{key: value for key, value in opt.items() if key in SimpleTwoTowerV2Config.__dataclass_fields__})
     print("Resolved configuration:\n" + json.dumps({key: str(value) if isinstance(value, Path) else value for key, value in cfg.__dict__.items()}, indent=2, default=str))
     if args.stage == "preprocess":
         from search_ads_system.recall.simple_two_tower_v2 import prepare_data
         data = prepare_data(cfg)
         print(json.dumps({"preprocessing": data.metadata, "cache_dir": str(cfg.cache_dir or cfg.output_dir / "simple_two_tower_v2_cache")}, indent=2, default=str))
+    elif args.stage == "mining":
+        from search_ads_system.recall.simple_two_tower_v2 import _load_or_mine_hard_negatives, _load_or_train_v2_teacher, prepare_data
+        import torch
+        data = prepare_data(cfg); device = torch.device("cuda" if cfg.device == "auto" and torch.cuda.is_available() else cfg.device if cfg.device != "auto" else "cpu")
+        teacher, teacher_meta = _load_or_train_v2_teacher(data, cfg, device)
+        _, mining = _load_or_mine_hard_negatives(teacher, data, cfg, device, teacher_meta)
+        print(json.dumps({**teacher_meta, **mining}, indent=2, default=str))
     elif args.stage == "tune":
         reports = []
         for batch_size in (8192, 16384, 32768):

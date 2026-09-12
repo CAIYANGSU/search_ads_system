@@ -189,6 +189,13 @@ simple_two_tower_v2:
   learning_rate: 0.001
   weight_decay: 0.00001
   negative_samples: 5
+  # V4 only: retain V2's random sampler, then add conservative Past-mined
+  # candidates from the V2 teacher. V0--V3 defaults and semantics are unchanged.
+  random_negative_count: 3
+  hard_negative_count: 2
+  hard_negative_retrieval_topn: 200
+  hard_negative_rank_start: 10
+  hard_negative_strategy: top_band
   click_weight: 1.0
   conversion_weight: 3.0
   temperature: 0.07

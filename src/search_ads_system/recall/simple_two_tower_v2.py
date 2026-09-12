@@ -45,6 +45,13 @@ class SimpleTwoTowerV2Config:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
     negative_samples: int = 5
+    # V4 is deliberately separate from ``negative_samples`` so changing its
+    # composition can never alter the historical V0--V2 sampled objective.
+    random_negative_count: int = 3
+    hard_negative_count: int = 2
+    hard_negative_retrieval_topn: int = 200
+    hard_negative_rank_start: int = 10
+    hard_negative_strategy: str = "top_band"
     click_weight: float = 1.0
     conversion_weight: float = 3.0
     temperature: float = 0.07
@@ -316,6 +323,7 @@ class SimpleTwoTowerV2Model(nn.Module):
         self.item_embeddings = nn.ModuleList([nn.Embedding(len(data.vocabs[field]) + 2, config.feature_embedding_dim, padding_idx=PAD_INDEX) for field in ITEM_FIELDS])
         self.context_embeddings = nn.ModuleList([nn.Embedding(len(data.vocabs[field]) + 2, config.feature_embedding_dim, padding_idx=PAD_INDEX) for field in USER_FIELDS])
         item_size = config.feature_embedding_dim if variant == "v0_id_only" else config.feature_embedding_dim * (1 + len(ITEM_FIELDS)) + 1
+        # v4_hard_negatives is intentionally architecturally identical to V2.
         user_size = config.feature_embedding_dim if variant in ("v0_id_only", "v1_item_content") else config.feature_embedding_dim * (1 + len(USER_FIELDS)) + 6
         self.item_tower, self.user_tower = _mlp(item_size, config.hidden_dims, config.embedding_dim), _mlp(user_size, config.hidden_dims, config.embedding_dim)
         self.register_buffer("item_ids", torch.as_tensor(_encode(data.products, data.vocabs["product_id"])))
@@ -379,11 +387,80 @@ def _sample_past_negatives(users: np.ndarray, data: PreparedData, count: int, rn
     return result
 
 
-def train_model(model: SimpleTwoTowerV2Model, data: PreparedData, config: SimpleTwoTowerV2Config, device: torch.device) -> dict[str, float]:
+def _negative_pool(user: int, data: PreparedData, forbidden: set[int]) -> np.ndarray:
+    """Return the Past catalogue entries safe for this user and batch row."""
+    excluded = data.histories[int(user)] | forbidden
+    return np.fromiter((item for item in range(len(data.products)) if item not in excluded), dtype=np.int64)
+
+
+def sample_mixed_negatives(
+    users: np.ndarray,
+    positives: np.ndarray,
+    hard_pools: list[np.ndarray],
+    data: PreparedData,
+    config: SimpleTwoTowerV2Config,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Sample V4's random + hard negatives without ever fabricating positives.
+
+    A short hard pool is filled by additional *random* Past-catalogue samples.
+    This is conservative: it preserves the requested fixed loss width while
+    never promoting an unclicked candidate to a label-derived negative.
+    """
+    width = config.random_negative_count + config.hard_negative_count
+    result = np.empty((len(users), width), dtype=np.int64)
+    requested_hard = min(config.hard_negative_count, width)
+    supplied_hard = 0
+    examples_with_requested = 0
+    duplicate_count = 0
+    fallback_examples = 0
+    for row, (user, positive, pool) in enumerate(zip(users, positives, hard_pools, strict=True)):
+        # Mining should already enforce this; validate it again at the boundary
+        # where training labels are constructed.
+        candidates = np.asarray(pool, dtype=np.int64)
+        candidates = candidates[(candidates != int(positive)) & ~np.isin(candidates, list(data.histories[int(user)]))]
+        candidates = np.unique(candidates)
+        take = min(requested_hard, len(candidates))
+        hard = rng.choice(candidates, size=take, replace=False) if take else np.empty(0, dtype=np.int64)
+        supplied_hard += take
+        examples_with_requested += int(take == requested_hard)
+        fallback_examples += int(take < requested_hard)
+        # The random part includes the hard shortfall.  Exclude selected hard
+        # entries where possible, so duplicates are only possible for tiny
+        # catalogues which cannot provide enough distinct negatives.
+        random_needed = config.random_negative_count + (requested_hard - take)
+        available = _negative_pool(int(user), data, set(hard.tolist()))
+        if not len(available):
+            # This can occur only when all safe candidates were selected as
+            # hard negatives. Reuse those safe values rather than a positive.
+            available = hard
+        random_part = rng.choice(available, size=random_needed, replace=len(available) < random_needed)
+        values = np.concatenate((random_part, hard))
+        if len(np.unique(values)) != len(values): duplicate_count += len(values) - len(np.unique(values))
+        result[row] = values
+    total = max(len(users), 1)
+    return result, {
+        "mixed_requested_hard_negatives": float(requested_hard),
+        "mixed_average_hard_negatives": supplied_hard / total,
+        "mixed_fraction_requested_hard": examples_with_requested / total,
+        "mixed_fraction_random_fallback": fallback_examples / total,
+        "mixed_duplicate_rate": duplicate_count / max(len(users) * width, 1),
+    }
+
+
+def train_model(
+    model: SimpleTwoTowerV2Model,
+    data: PreparedData,
+    config: SimpleTwoTowerV2Config,
+    device: torch.device,
+    *,
+    hard_pools: list[np.ndarray] | None = None,
+) -> dict[str, float]:
     rng = np.random.default_rng(config.seed); model.to(device); model.train(); optimizer = _optimizer(model, config)
     users, items, context, weights = data.train_user, data.train_item, data.train_context, data.train_weight
     _synchronize_cuda(device)
     start, samples, batches, loss_sum = time.perf_counter(), 0, 0, 0.0
+    mixed_totals: defaultdict[str, float] = defaultdict(float)
     bf16 = config.use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
     for _ in range(config.epochs):
         for offset in range(0, len(users), config.batch_size):
@@ -395,15 +472,23 @@ def train_model(model: SimpleTwoTowerV2Model, data: PreparedData, config: Simple
                 uv, pv = model.encode_users(u, c), model.encode_items(p)
                 if model.variant == "v3_in_batch_negatives": loss = duplicate_aware_inbatch_loss(uv @ pv.T / config.temperature, p, w)
                 else:
-                    negatives = _sample_past_negatives(users[indices], data, config.negative_samples, rng)
-                    nv = model.encode_items(_device_array(negatives.reshape(-1), device)).reshape(len(indices), config.negative_samples, -1)
+                    if model.variant == "v4_hard_negatives":
+                        if hard_pools is None: raise ValueError("V4 requires Past-mined hard-negative pools")
+                        negatives, sampled = sample_mixed_negatives(users[indices], items[indices], [hard_pools[int(i)] for i in indices], data, config, rng)
+                        for key, value in sampled.items(): mixed_totals[key] += value * len(indices)
+                    else:
+                        negatives = _sample_past_negatives(users[indices], data, config.negative_samples, rng)
+                    nv = model.encode_items(_device_array(negatives.reshape(-1), device)).reshape(len(indices), negatives.shape[1], -1)
                     logits = torch.cat(((uv * pv).sum(1, keepdim=True), torch.einsum("bd,bnd->bn", uv, nv)), 1) / config.temperature
                     loss = (F.cross_entropy(logits, torch.zeros(len(indices), dtype=torch.long, device=device), reduction="none") * w).sum() / w.sum().clamp_min(1)
             optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
             samples += len(indices); batches += 1; loss_sum += float(loss.detach())
     _synchronize_cuda(device)
     elapsed = time.perf_counter() - start
-    return {"training_wall_seconds": elapsed, "training_rows_per_second": samples / max(elapsed, 1e-9), "training_batches_per_second": batches / max(elapsed, 1e-9), "train_loss": loss_sum / max(batches, 1), "bf16_active": bf16}
+    result = {"training_wall_seconds": elapsed, "training_rows_per_second": samples / max(elapsed, 1e-9), "training_batches_per_second": batches / max(elapsed, 1e-9), "train_loss": loss_sum / max(batches, 1), "bf16_active": bf16}
+    if mixed_totals:
+        result.update({key: value / max(samples, 1) for key, value in mixed_totals.items()})
+    return result
 
 
 @torch.no_grad()
@@ -417,19 +502,190 @@ def _embeddings(model: SimpleTwoTowerV2Model, count: int, batch_size: int, devic
 
 
 def _search(index: Any, queries: np.ndarray, count: int) -> tuple[np.ndarray, np.ndarray]:
-    return index.search(queries, count)
+    # FAISS's native bindings require C-contiguous float32 input; PyTorch's
+    # CPU views are not guaranteed to satisfy that on every platform.
+    return index.search(np.ascontiguousarray(queries, dtype=np.float32), count)
 
 
 def _build_index(embeddings: np.ndarray) -> Any:
     try:
         import faiss
-        index = faiss.IndexFlatIP(embeddings.shape[1]); index.add(embeddings); return index
+        # Some local macOS FAISS builds cannot initialize their default OpenMP
+        # pool; one thread remains batched and avoids a native crash.
+        if hasattr(faiss, "omp_set_num_threads"): faiss.omp_set_num_threads(1)
+        values = np.ascontiguousarray(embeddings, dtype=np.float32)
+        index = faiss.IndexFlatIP(values.shape[1]); index.add(values); return index
     except ImportError:
         class NumpyIP:
             def __init__(self, matrix: np.ndarray): self.matrix, self.ntotal = matrix, len(matrix)
             def search(self, q: np.ndarray, k: int):
                 scores = q @ self.matrix.T; pos = np.argpartition(-scores, kth=min(k - 1, scores.shape[1] - 1), axis=1)[:, :k]; order = np.take_along_axis(scores, pos, axis=1).argsort(1)[:, ::-1]; return np.take_along_axis(scores, np.take_along_axis(pos, order, 1), 1), np.take_along_axis(pos, order, 1)
         return NumpyIP(embeddings)
+
+
+def _array_fingerprint(*arrays: np.ndarray) -> str:
+    digest = hashlib.sha256()
+    for value in arrays:
+        array = np.ascontiguousarray(value)
+        digest.update(str(array.dtype).encode()); digest.update(str(array.shape).encode()); digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _v2_teacher_fingerprint(data: PreparedData, config: SimpleTwoTowerV2Config) -> str:
+    """Identity of the Past-only V2 teacher, independent of V4 settings."""
+    payload = {
+        "schema": 1,
+        "past_catalogue": _array_fingerprint(data.products, data.item_features, data.item_price),
+        "training": _array_fingerprint(data.train_user, data.train_item, data.train_context, data.train_weight),
+        "vocabs": data.vocabs,
+        "seed": config.seed,
+        "architecture": [config.embedding_dim, config.feature_embedding_dim, config.hidden_dims],
+        "optimizer": [config.epochs, config.batch_size, config.learning_rate, config.weight_decay, config.negative_samples, config.temperature, config.click_weight, config.conversion_weight, config.use_bf16],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _checkpoint_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""): digest.update(block)
+    return digest.hexdigest()
+
+
+def _load_or_train_v2_teacher(data: PreparedData, config: SimpleTwoTowerV2Config, device: torch.device) -> tuple[SimpleTwoTowerV2Model, dict[str, Any]]:
+    """Return a normal V2 teacher without consulting Future-A labels or truth."""
+    root = _cache_root(config) / "hard_negatives" / "teachers"; root.mkdir(parents=True, exist_ok=True)
+    identity = _v2_teacher_fingerprint(data, config); checkpoint = root / f"v2_teacher_{identity}.pt"
+    model = SimpleTwoTowerV2Model(data, config, "v2_user_context_stats")
+    started = time.perf_counter()
+    if checkpoint.is_file():
+        try:
+            state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        except TypeError:  # torch < 2.0
+            state = torch.load(checkpoint, map_location="cpu")
+        model.load_state_dict(state); model.to(device)
+        return model, {"teacher_cache_hit": True, "teacher_cache_load_seconds": time.perf_counter() - started, "teacher_checkpoint": str(checkpoint), "teacher_checkpoint_sha256": _checkpoint_digest(checkpoint)}
+    train = train_model(model, data, config, device)
+    model.to("cpu")
+    torch.save(model.state_dict(), checkpoint)
+    model.to(device)
+    return model, {"teacher_cache_hit": False, "teacher_training_wall_seconds": train["training_wall_seconds"], "teacher_checkpoint": str(checkpoint), "teacher_checkpoint_sha256": _checkpoint_digest(checkpoint)}
+
+
+def _hard_negative_fingerprint(data: PreparedData, config: SimpleTwoTowerV2Config, teacher_sha256: str) -> str:
+    payload = {
+        "schema": 1, "teacher_checkpoint_sha256": teacher_sha256,
+        "past_catalogue": _array_fingerprint(data.products),
+        "training": _array_fingerprint(data.train_user, data.train_item, data.train_context),
+        "feature_vocab": hashlib.sha256(json.dumps(data.vocabs, sort_keys=True).encode()).hexdigest(),
+        "seed": config.seed, "topn": config.hard_negative_retrieval_topn,
+        "rank_start": config.hard_negative_rank_start, "strategy": config.hard_negative_strategy,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def assert_past_only_hard_negative_contract(data: PreparedData, users: np.ndarray, positives: np.ndarray, pools: list[np.ndarray]) -> None:
+    """Boundary assertion: mined negatives are Past-catalogue non-positives only.
+
+    The miner's API intentionally has no Future-A argument. This assertion
+    guards the two ways a leaked label could enter its output: a non-catalogue
+    item or a Past known-positive item.
+    """
+    catalogue_size = len(data.products)
+    for user, positive, pool in zip(users, positives, pools, strict=True):
+        values = np.asarray(pool, dtype=np.int64)
+        if np.any(values < 0) or np.any(values >= catalogue_size): raise AssertionError("Hard-negative mining emitted a non-Past-catalogue item")
+        if int(positive) in values: raise AssertionError("Current positive item was mined as a negative")
+        if any(int(value) in data.histories[int(user)] for value in values): raise AssertionError("Known Past positive was mined as a negative")
+
+
+@torch.no_grad()
+def _mine_hard_negative_pools(model: SimpleTwoTowerV2Model, data: PreparedData, config: SimpleTwoTowerV2Config, device: torch.device) -> tuple[list[np.ndarray], dict[str, float]]:
+    if config.hard_negative_strategy != "top_band": raise ValueError(f"Unsupported hard-negative strategy: {config.hard_negative_strategy}")
+    if config.hard_negative_retrieval_topn < 1 or config.hard_negative_rank_start < 0: raise ValueError("Hard-negative retrieval parameters must be non-negative and non-empty")
+    # Context participates in the key. We only reuse a retrieval pool when V2
+    # would produce the identical user representation for that training row.
+    keys = np.column_stack((data.train_user, data.train_context)).astype(np.int64, copy=False)
+    groups, inverse = np.unique(keys, axis=0, return_inverse=True)
+    try:
+        import faiss
+    except ImportError as exc:
+        # Unlike the evaluator's small local fallback, V4 must never degrade
+        # into a user-by-catalogue dense score matrix during mining.
+        raise RuntimeError("v4_hard_negatives requires faiss-cpu/faiss-gpu; install the repository requirements before mining") from exc
+    if hasattr(faiss, "omp_set_num_threads"): faiss.omp_set_num_threads(1)
+    model.eval(); item_vectors = _embeddings(model, len(data.products), config.inference_batch_size, device, users=False)
+    item_vectors = np.ascontiguousarray(item_vectors, dtype=np.float32)
+    index = faiss.IndexFlatIP(item_vectors.shape[1]); index.add(item_vectors)
+    requested = min(len(data.products), config.hard_negative_retrieval_topn)
+    group_pools: list[np.ndarray] = []; group_ranks: list[np.ndarray] = []
+    rejected = 0
+    for start in range(0, len(groups), config.retrieval_batch_size):
+        batch = groups[start:start + config.retrieval_batch_size]
+        vectors: list[np.ndarray] = []
+        for offset in range(0, len(batch), config.inference_batch_size):
+            piece = batch[offset:offset + config.inference_batch_size]
+            positions = torch.as_tensor(piece[:, 0], device=device)
+            context = torch.as_tensor(piece[:, 1:], device=device)
+            vectors.append(model.encode_users(positions, context).float().cpu().numpy())
+        _, positions = _search(index, np.concatenate(vectors).astype(np.float32, copy=False), requested)
+        for key, retrieved in zip(batch, positions, strict=True):
+            history = data.histories[int(key[0])]
+            allowed = [int(item) for item in retrieved if int(item) not in history]
+            rejected += len(retrieved) - len(allowed)
+            # rank_start is applied after known-positive removal, so the
+            # highest unlabelled-looking candidates can be conservatively skipped.
+            selected = np.asarray(allowed[config.hard_negative_rank_start:], dtype=np.int64)
+            original_ranks = np.asarray([rank + 1 for rank, item in enumerate(retrieved) if int(item) not in history][config.hard_negative_rank_start:], dtype=np.int64)
+            group_pools.append(selected); group_ranks.append(original_ranks)
+    pools = [group_pools[int(group)] for group in inverse]
+    ranks = [group_ranks[int(group)] for group in inverse]
+    assert_past_only_hard_negative_contract(data, data.train_user, data.train_item, pools)
+    available = np.asarray([len(pool) for pool in pools], dtype=np.float64)
+    all_ranks = np.concatenate([rank for rank in ranks if len(rank)]) if any(len(rank) for rank in ranks) else np.empty(0)
+    pool_values = np.concatenate([pool for pool in pools if len(pool)]) if any(len(pool) for pool in pools) else np.empty(0, dtype=np.int64)
+    counts = np.bincount(data.train_item, minlength=len(data.products)); order = np.argsort(counts)
+    buckets = {"tail": set(order[:int(.5 * len(order))]), "mid": set(order[int(.5 * len(order)):int(.8 * len(order))]), "head": set(order[int(.8 * len(order)):])}
+    diagnostics: dict[str, float] = {
+        "hard_negative_unique_user_contexts": float(len(groups)), "hard_negative_average_available_per_user_context": float(available.mean()) if len(available) else 0.0,
+        "hard_negative_fraction_examples_requested_available": float(np.mean(available >= config.hard_negative_count)) if len(available) else 0.0,
+        "hard_negative_known_positive_rejections": float(rejected), "hard_negative_known_positive_rejection_rate": rejected / max(len(groups) * requested, 1),
+        "hard_negative_average_v2_rank": float(all_ranks.mean()) if len(all_ranks) else float("nan"), "hard_negative_p50_v2_rank": float(np.percentile(all_ranks, 50)) if len(all_ranks) else float("nan"),
+        "hard_negative_p95_v2_rank": float(np.percentile(all_ranks, 95)) if len(all_ranks) else float("nan"), "hard_negative_unique_items": float(len(np.unique(pool_values))),
+        "hard_negative_pool_duplicate_rate": 0.0,
+    }
+    for name, values in buckets.items(): diagnostics[f"hard_negative_{name}_fraction"] = sum(int(item) in values for item in pool_values) / max(len(pool_values), 1)
+    return pools, diagnostics
+
+
+def _load_or_mine_hard_negatives(model: SimpleTwoTowerV2Model, data: PreparedData, config: SimpleTwoTowerV2Config, device: torch.device, teacher: Mapping[str, Any]) -> tuple[list[np.ndarray], dict[str, Any]]:
+    """Cache compact user/context pools; stale fingerprints are never reused."""
+    root = _cache_root(config) / "hard_negatives"; root.mkdir(parents=True, exist_ok=True)
+    fingerprint = _hard_negative_fingerprint(data, config, str(teacher["teacher_checkpoint_sha256"]))
+    arrays_path, metadata_path = root / f"{fingerprint}.npz", root / f"{fingerprint}.json"
+    if arrays_path.is_file() and metadata_path.is_file():
+        started = time.perf_counter(); metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("fingerprint") == fingerprint:
+            with np.load(arrays_path, allow_pickle=False) as values:
+                keys, inverse, offsets, items = (values[name].copy() for name in ("user_context_keys", "training_group_index", "candidate_offsets", "candidate_item_indices"))
+            if len(inverse) == len(data.train_user) and len(keys) == len(offsets) - 1:
+                groups = [items[offsets[i]:offsets[i + 1]] for i in range(len(keys))]
+                pools = [groups[int(index)] for index in inverse]
+                assert_past_only_hard_negative_contract(data, data.train_user, data.train_item, pools)
+                return pools, {**metadata["diagnostics"], "hard_negative_cache_hit": True, "hard_negative_cache_load_seconds": time.perf_counter() - started, "hard_negative_mining_wall_seconds": 0.0, "hard_negative_cache_path": str(arrays_path), "hard_negative_fingerprint": fingerprint}
+        _log("[hard-negatives] cache metadata did not match; re-mining.")
+    started = time.perf_counter(); pools, diagnostics = _mine_hard_negative_pools(model, data, config, device)
+    # Store one pool per exact (user, encoded-context) key rather than one per
+    # interaction. This preserves V2 semantics and is much smaller on repeat users.
+    keys = np.column_stack((data.train_user, data.train_context)).astype(np.int64, copy=False)
+    groups, inverse = np.unique(keys, axis=0, return_inverse=True)
+    group_pools = [pools[int(np.flatnonzero(inverse == index)[0])] for index in range(len(groups))]
+    offsets = [0]; flat: list[int] = []
+    for pool in group_pools: flat.extend(pool.tolist()); offsets.append(len(flat))
+    np.savez_compressed(arrays_path, user_context_keys=groups, training_group_index=inverse.astype(np.int64), candidate_offsets=np.asarray(offsets, dtype=np.int64), candidate_item_indices=np.asarray(flat, dtype=np.int64))
+    diagnostics = {**diagnostics, "hard_negative_cache_hit": False, "hard_negative_cache_load_seconds": 0.0, "hard_negative_mining_wall_seconds": time.perf_counter() - started, "hard_negative_cache_path": str(arrays_path), "hard_negative_fingerprint": fingerprint}
+    metadata_path.write_text(json.dumps({"fingerprint": fingerprint, "teacher_checkpoint_sha256": teacher["teacher_checkpoint_sha256"], "diagnostics": diagnostics}, indent=2, default=str), encoding="utf-8")
+    return pools, diagnostics
 
 
 def write_candidates(model: SimpleTwoTowerV2Model, data: PreparedData, config: SimpleTwoTowerV2Config, device: torch.device, variant: str) -> dict[str, float]:
@@ -513,21 +769,50 @@ def run_ablation(config: SimpleTwoTowerV2Config) -> pd.DataFrame:
     np.savetxt(config.output_dir / "evaluation_users.txt", data.users, fmt="%s")
     rows: list[dict[str, Any]] = []
     for variant in config.variants:
-        if variant not in {"v0_id_only", "v1_item_content", "v2_user_context_stats", "v3_in_batch_negatives"}: raise ValueError(f"Unknown variant: {variant}")
+        if variant not in {"v0_id_only", "v1_item_content", "v2_user_context_stats", "v3_in_batch_negatives", "v4_hard_negatives"}: raise ValueError(f"Unknown variant: {variant}")
         _log(f"[train] starting {variant}...")
         if device.type == "cuda": torch.cuda.reset_peak_memory_stats(device)
+        hard_pools: list[np.ndarray] | None = None
+        hard_metadata: dict[str, Any] = {}
+        if variant == "v4_hard_negatives":
+            # The teacher has the normal V2 sampled-negative objective.  Both
+            # teacher training and mining have only PreparedData's Past arrays;
+            # Future-A truth is passed solely to evaluation below.
+            teacher, teacher_metadata = _load_or_train_v2_teacher(data, config, device)
+            hard_pools, hard_metadata = _load_or_mine_hard_negatives(teacher, data, config, device, teacher_metadata)
+            hard_metadata.update(teacher_metadata)
+            torch.manual_seed(config.seed)  # deterministic V4 initialization independent of cache hit.
         model: Any = SimpleTwoTowerV2Model(data, config, variant)
         if config.use_torch_compile and hasattr(torch, "compile"):
             model = torch.compile(model)
-        train = train_model(model, data, config, device); retrieval = write_candidates(model, data, config, device, variant)
+        train = train_model(model, data, config, device, hard_pools=hard_pools); retrieval = write_candidates(model, data, config, device, variant)
         metrics = evaluate_candidates(Path(retrieval["candidate_path"]), data.truth, data.warm_truth, set(data.products), top_k=config.top_k)
         metrics.update(popularity_metrics(Path(retrieval["candidate_path"]), data.truth, data, top_k=config.top_k)); gpu = torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0.0
         try:
             import psutil
             host_mb = psutil.Process(os.getpid()).memory_info().rss / 2**20
         except ImportError: host_mb = float("nan")
-        rows.append({"model": variant, **data.metadata, **train, **retrieval, **metrics, "preprocessing_elapsed_seconds": preprocess_seconds, "end_to_end_elapsed_seconds": time.perf_counter() - overall_started, "peak_gpu_mb": gpu, "peak_host_ram_mb": host_mb})
+        rows.append({"model": variant, **data.metadata, **hard_metadata, **train, **retrieval, **metrics, "preprocessing_elapsed_seconds": preprocess_seconds, "end_to_end_elapsed_seconds": time.perf_counter() - overall_started, "peak_gpu_mb": gpu, "peak_host_ram_mb": host_mb})
     frame = pd.DataFrame(rows); metrics_path = config.output_dir / "metrics"; metrics_path.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(metrics_path / "simple_two_tower_v2_ablation.csv", index=False)
-    (metrics_path / "simple_two_tower_v2_metadata.json").write_text(json.dumps({"config": asdict(config) | {"past_path": str(config.past_path), "future_a_path": str(config.future_a_path), "output_dir": str(config.output_dir)}, "data": data.metadata, "contract": "Past-only fitting/training/features; Future-A evaluation labels only; Future-B untouched; warm-catalogue retrieval only."}, indent=2, default=str), encoding="utf-8")
+    # A V4-only invocation must never overwrite the published V0--V3 table.
+    suffix = "v4_hard_negatives" if "v4_hard_negatives" in config.variants else "ablation"
+    frame.to_csv(metrics_path / f"simple_two_tower_v2_{suffix}.csv", index=False)
+    metadata_name = f"simple_two_tower_v2_{suffix}_metadata.json"
+    (metrics_path / metadata_name).write_text(json.dumps({"config": asdict(config) | {"past_path": str(config.past_path), "future_a_path": str(config.future_a_path), "output_dir": str(config.output_dir)}, "data": data.metadata, "contract": "Past-only fitting/training/features; hard-negative teacher and FAISS mining use Past arrays/catalogue only; Future-A is passed only to the fixed evaluator; Future-B untouched; warm-catalogue retrieval only."}, indent=2, default=str), encoding="utf-8")
+    if "v4_hard_negatives" in config.variants:
+        old_path = metrics_path / "simple_two_tower_v2_ablation.csv"
+        baseline = pd.read_csv(old_path) if old_path.is_file() else pd.DataFrame()
+        combined = pd.concat((baseline[~baseline.get("model", pd.Series(dtype=str)).eq("v4_hard_negatives")] if len(baseline) else baseline, frame), ignore_index=True, sort=False)
+        # This is a new comparison artifact: the historical baseline CSV is
+        # read-only, so published V0--V3 rows are never rewritten by V4.
+        combined.to_csv(metrics_path / "simple_two_tower_v2_v0_to_v4_comparison.csv", index=False)
+        if {"v2_user_context_stats", "v4_hard_negatives"}.issubset(set(combined.model)):
+            v2, v4 = (combined.loc[combined.model.eq(name)].iloc[-1] for name in ("v2_user_context_stats", "v4_hard_negatives"))
+            def delta(key: str) -> float: return float(v4[key] - v2[key])
+            def finite_value(row: pd.Series, key: str) -> float:
+                value = row.get(key, 0.0)
+                return 0.0 if pd.isna(value) else float(value)
+            mining_seconds = finite_value(v4, "hard_negative_mining_wall_seconds") + finite_value(v4, "teacher_training_wall_seconds")
+            comparison = {"v4_vs_v2_warm_recall@100_absolute": delta("warm_recall@100"), "v4_vs_v2_warm_recall@100_relative": delta("warm_recall@100") / max(abs(float(v2["warm_recall@100"])), 1e-12), "v4_vs_v2_overall_recall@100": delta("overall_recall@100"), "v4_vs_v2_ndcg@100": delta("ndcg@100"), "v4_vs_v2_training_seconds": delta("training_wall_seconds"), "v4_teacher_and_mining_seconds": mining_seconds, "v4_vs_v2_training_plus_mining_seconds": delta("training_wall_seconds") + mining_seconds, "v4_vs_v2_peak_gpu_mb": delta("peak_gpu_mb")}
+            (metrics_path / "simple_two_tower_v2_v4_comparison.json").write_text(json.dumps(comparison, indent=2), encoding="utf-8")
     return frame

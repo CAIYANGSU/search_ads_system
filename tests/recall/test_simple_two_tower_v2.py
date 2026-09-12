@@ -1,6 +1,7 @@
 """Focused contract tests for the independent simple Two-Tower v2."""
 from __future__ import annotations
 
+from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
@@ -8,7 +9,8 @@ import torch
 
 from search_ads_system.recall.simple_two_tower_v2 import (
     OOV_INDEX, SimpleTwoTowerV2Config, SimpleTwoTowerV2Model, _encode,
-    _source_fingerprint, _synchronize_cuda, _vocab, duplicate_aware_inbatch_loss, evaluate_candidates, prepare_data, run_ablation,
+    _hard_negative_fingerprint, _mine_hard_negative_pools, _source_fingerprint, _synchronize_cuda, _v2_teacher_fingerprint, _vocab,
+    assert_past_only_hard_negative_contract, duplicate_aware_inbatch_loss, evaluate_candidates, prepare_data, run_ablation, sample_mixed_negatives,
 )
 
 
@@ -144,3 +146,65 @@ def test_end_to_end_cpu_smoke_all_four_variants(tmp_path):
     for variant in cfg.variants:
         candidates = pd.read_csv(cfg.output_dir / "candidates" / f"{variant}_top50.csv")
         assert candidates.groupby("user_id").size().le(50).all()
+
+
+def _v4_data(tmp_path):
+    # u1 has one known Past positive and five safe Past catalogue candidates;
+    # u2 supplies the remaining catalogue content but has no trainable negative.
+    past = []
+    for index in range(6):
+        row = _rows(10 + index, ("u1" if index == 0 else "u2",))[0]
+        row.update(product_id=f"p{index}", conversion_label=0)
+        past.append(row)
+    future = [{**_rows(40 + index, ("u1",))[0], "product_id": f"p{index}"} for index in range(6)]
+    future.append({**_rows(50, ("u2",))[0], "product_id": "p1"})
+    _window(tmp_path / "past", past); _window(tmp_path / "future_a", future)
+    cfg = SimpleTwoTowerV2Config(tmp_path / "past", tmp_path / "future_a", tmp_path / "out", max_users=2, batch_size=2, epochs=1, top_k=50, hidden_dims=(8,), embedding_dim=4, feature_embedding_dim=3, device="cpu", use_bf16=False, random_negative_count=2, hard_negative_count=2, hard_negative_retrieval_topn=6, hard_negative_rank_start=0)
+    return prepare_data(cfg), cfg
+
+
+def test_v4_mining_is_past_only_deterministic_and_excludes_known_positives(tmp_path):
+    pytest.importorskip("faiss")
+    data, cfg = _v4_data(tmp_path)
+    torch.manual_seed(cfg.seed); first_model = SimpleTwoTowerV2Model(data, cfg, "v2_user_context_stats")
+    first, _ = _mine_hard_negative_pools(first_model, data, cfg, torch.device("cpu"))
+    # Truth is intentionally changed to impossible Future-A labels. Mining has
+    # no truth argument and must return the same Past-only candidate pools.
+    data.truth = {"u1": {"future_only"}}; data.warm_truth = {"u1": set()}
+    torch.manual_seed(cfg.seed); second_model = SimpleTwoTowerV2Model(data, cfg, "v2_user_context_stats")
+    second, _ = _mine_hard_negative_pools(second_model, data, cfg, torch.device("cpu"))
+    assert [x.tolist() for x in first] == [x.tolist() for x in second]
+    assert_past_only_hard_negative_contract(data, data.train_user, data.train_item, first)
+
+
+def test_v4_mixed_sampler_composition_and_random_fallback(tmp_path):
+    data, cfg = _v4_data(tmp_path)
+    users, positives = data.train_user[:1], data.train_item[:1]
+    pool = np.asarray([item for item in range(len(data.products)) if item not in data.histories[int(users[0])]], dtype=np.int64)
+    values, diagnostics = sample_mixed_negatives(users, positives, [pool], data, cfg, np.random.default_rng(9))
+    assert values.shape == (1, 4) and len(set(values[0])) == 4
+    assert set(values[0, cfg.random_negative_count:]).issubset(set(pool))
+    assert diagnostics["mixed_fraction_requested_hard"] == 1
+    fallback, fallback_diag = sample_mixed_negatives(users, positives, [pool[:1]], data, cfg, np.random.default_rng(9))
+    assert fallback.shape == (1, 4) and fallback_diag["mixed_fraction_random_fallback"] == 1
+    assert int(positives[0]) not in fallback[0] and not set(fallback[0]) & data.histories[int(users[0])]
+
+
+def test_v4_cache_fingerprints_invalidate_with_mining_and_teacher_inputs(tmp_path):
+    data, cfg = _v4_data(tmp_path)
+    teacher = _v2_teacher_fingerprint(data, cfg)
+    baseline = _hard_negative_fingerprint(data, cfg, teacher)
+    assert _hard_negative_fingerprint(data, replace(cfg, hard_negative_rank_start=1), teacher) != baseline
+    assert _hard_negative_fingerprint(data, cfg, "changed-checkpoint") != baseline
+
+
+def test_v4_end_to_end_smoke_uses_reusable_hard_negative_cache(tmp_path):
+    pytest.importorskip("faiss")
+    _, cfg = _v4_data(tmp_path)
+    v4 = replace(cfg, variants=("v4_hard_negatives",))
+    cold, warm = run_ablation(v4), run_ablation(v4)
+    assert cold.model.tolist() == ["v4_hard_negatives"]
+    assert not bool(cold.loc[0, "hard_negative_cache_hit"])
+    assert bool(warm.loc[0, "hard_negative_cache_hit"])
+    assert (v4.output_dir / "metrics" / "simple_two_tower_v2_v4_hard_negatives.csv").is_file()
+    assert (v4.output_dir / "metrics" / "simple_two_tower_v2_v0_to_v4_comparison.csv").is_file()

@@ -314,7 +314,7 @@ def generate_two_tower_candidates(
             user_position = start + relative_position
             rank = 0
             for score, ad_position in zip(scores[relative_position], positions[relative_position], strict=True):
-                if ad_position < 0 or int(ad_position) in histories[user_position]:
+                if ad_position < 0 or int(ad_position) >= len(product_ids) or int(ad_position) in histories[user_position]:
                     continue
                 rank += 1
                 rows.append((str(user_id), str(product_ids[int(ad_position)]), float(score), rank))
